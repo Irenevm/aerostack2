@@ -35,6 +35,9 @@
 #include <a_star.hpp>
 #include <utils.hpp>
 
+#include <deque>
+#include <limits>
+
 namespace a_star
 {
 void Plugin::initialize(as2::Node * node_ptr, std::shared_ptr<tf2_ros::Buffer> tf_buffer)
@@ -106,8 +109,7 @@ bool Plugin::on_activate(
               << std::endl;
     drone_mask_factor_ = 1;
   } else {
-    std::cout << "chorizo gordo"
-              << std::endl;
+    RCLCPP_INFO(node_ptr_->get_logger(), "Computing first path with configured drone mask");
   }
 
   auto test = a_star_searcher_.update_grid(
@@ -207,7 +209,20 @@ bool Plugin::is_occupied(const geometry_msgs::msg::PointStamped & point)
 {
   Point2i cell = utils::pointToCell(
     point, last_occ_grid_.info, last_occ_grid_.header.frame_id, tf_buffer_);
+  if (!cell_in_map(cell)) {
+    RCLCPP_WARN(
+      node_ptr_->get_logger(), "Point [%.2f, %.2f] is outside the occupancy grid.",
+      point.point.x, point.point.y);
+    return true;
+  }
   return a_star_searcher_.cell_occuppied(cell);
+}
+
+bool Plugin::is_unknown(const geometry_msgs::msg::PointStamped & point)
+{
+  Point2i cell = utils::pointToCell(
+    point, last_occ_grid_.info, last_occ_grid_.header.frame_id, tf_buffer_);
+  return is_unknown_cell(cell);
 }
 
 bool Plugin::is_path_traversable(const std::vector<geometry_msgs::msg::PointStamped> & path)
@@ -215,14 +230,49 @@ bool Plugin::is_path_traversable(const std::vector<geometry_msgs::msg::PointStam
   for (const auto & p : path) {
     Point2i cell = utils::pointToCell(
       p, last_occ_grid_.info, last_occ_grid_.header.frame_id, tf_buffer_);
-    if (a_star_searcher_.cell_occuppied(cell)) {
+    if (!is_known_free_cell(cell)) {
       RCLCPP_WARN(
-        node_ptr_->get_logger(), "Path is not traversable. Cell (%d, %d) is occupied.", cell.x,
-        cell.y);
+        node_ptr_->get_logger(),
+        "Path is not traversable. Cell (%d, %d) value=%d unknown=%s occupied_or_inflated=%s.",
+        cell.x, cell.y, occupancy_value(cell), is_unknown_cell(cell) ? "true" : "false",
+        is_occupied(p) ? "true" : "false");
       return false;
     }
   }
   return true;
+}
+
+bool Plugin::cell_in_map(const Point2i & cell) const
+{
+  return cell.x >= 0 && cell.y >= 0 &&
+         cell.x < static_cast<int>(last_occ_grid_.info.width) &&
+         cell.y < static_cast<int>(last_occ_grid_.info.height);
+}
+
+int Plugin::occupancy_value(const Point2i & cell) const
+{
+  if (!cell_in_map(cell)) {
+    return 100;
+  }
+  const size_t index =
+    static_cast<size_t>(cell.y) * last_occ_grid_.info.width + static_cast<size_t>(cell.x);
+  return static_cast<int>(last_occ_grid_.data[index]);
+}
+
+bool Plugin::is_unknown_cell(const Point2i & cell) const
+{
+  return !cell_in_map(cell) || occupancy_value(cell) < 0;
+}
+
+bool Plugin::is_known_free_cell(const Point2i & cell)
+{
+  if (!cell_in_map(cell) || is_unknown_cell(cell)) {
+    return false;
+  }
+  if (occupancy_value(cell) > 30) {
+    return false;
+  }
+  return !a_star_searcher_.cell_occuppied(cell);
 }
 
 std::vector<geometry_msgs::msg::PointStamped> Plugin::bresenham_line(
@@ -273,17 +323,86 @@ geometry_msgs::msg::PointStamped Plugin::closest_free_point(
   const geometry_msgs::msg::PointStamped & start,
   const geometry_msgs::msg::PointStamped & goal)
 {
-  std::vector<geometry_msgs::msg::PointStamped> line_points = bresenham_line(start, goal);
-  for (auto it = line_points.rbegin(); it != line_points.rend(); ++it) {
-    if (!is_occupied(*it)) {
-      RCLCPP_INFO(
-        node_ptr_->get_logger(), "Found closest free point at (%f, %f)",
-        it->point.x, it->point.y);
-      return *it;
+  Point2i start_cell = utils::pointToCell(
+    start, last_occ_grid_.info, last_occ_grid_.header.frame_id, tf_buffer_);
+  Point2i goal_cell = utils::pointToCell(
+    goal, last_occ_grid_.info, last_occ_grid_.header.frame_id, tf_buffer_);
+
+  if (!cell_in_map(start_cell)) {
+    RCLCPP_ERROR(
+      node_ptr_->get_logger(), "Start cell (%d, %d) is outside the occupancy grid.",
+      start_cell.x, start_cell.y);
+    return start;
+  }
+
+  const int width = static_cast<int>(last_occ_grid_.info.width);
+  const int height = static_cast<int>(last_occ_grid_.info.height);
+  std::vector<bool> visited(static_cast<size_t>(width * height), false);
+  std::deque<Point2i> queue;
+
+  auto index = [width](const Point2i & cell) {
+      return static_cast<size_t>(cell.y * width + cell.x);
+    };
+
+  queue.push_back(start_cell);
+  visited[index(start_cell)] = true;
+
+  Point2i best_cell = start_cell;
+  double best_distance = std::numeric_limits<double>::max();
+  bool found_reachable_free_cell = false;
+
+  const std::vector<Point2i> neighbors = {
+    Point2i(1, 0), Point2i(-1, 0), Point2i(0, 1), Point2i(0, -1),
+    Point2i(1, 1), Point2i(1, -1), Point2i(-1, 1), Point2i(-1, -1)
+  };
+
+  while (!queue.empty()) {
+    Point2i current = queue.front();
+    queue.pop_front();
+
+    if (is_known_free_cell(current)) {
+      const double dx = static_cast<double>(current.x - goal_cell.x);
+      const double dy = static_cast<double>(current.y - goal_cell.y);
+      const double distance = dx * dx + dy * dy;
+      if (distance < best_distance) {
+        best_distance = distance;
+        best_cell = current;
+        found_reachable_free_cell = true;
+      }
+    }
+
+    for (const auto & offset : neighbors) {
+      Point2i next(current.x + offset.x, current.y + offset.y);
+      if (!cell_in_map(next) || visited[index(next)] || !is_known_free_cell(next)) {
+        continue;
+      }
+      visited[index(next)] = true;
+      queue.push_back(next);
     }
   }
-  RCLCPP_ERROR(node_ptr_->get_logger(), "No free point found on the line.");
-  return start;  // Return start if no free point found
+
+  if (found_reachable_free_cell) {
+    geometry_msgs::msg::PointStamped best_point;
+    best_point.header = last_occ_grid_.header;
+    best_point.point.x =
+      best_cell.x * last_occ_grid_.info.resolution +
+      last_occ_grid_.info.origin.position.x +
+      last_occ_grid_.info.resolution / 2.0;
+    best_point.point.y =
+      best_cell.y * last_occ_grid_.info.resolution +
+      last_occ_grid_.info.origin.position.y +
+      last_occ_grid_.info.resolution / 2.0;
+    RCLCPP_INFO(
+      node_ptr_->get_logger(),
+      "Found reachable known-free point closest to goal at [%.2f, %.2f], cell (%d, %d), "
+      "goal cell (%d, %d), squared cell distance %.2f.",
+      best_point.point.x, best_point.point.y, best_cell.x, best_cell.y, goal_cell.x, goal_cell.y,
+      best_distance);
+    return best_point;
+  }
+
+  RCLCPP_ERROR(node_ptr_->get_logger(), "No reachable known-free point found.");
+  return start;
 }
 
 visualization_msgs::msg::Marker Plugin::get_path_marker(

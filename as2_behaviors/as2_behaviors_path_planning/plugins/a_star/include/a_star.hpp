@@ -70,6 +70,7 @@ public:
 
   bool is_occupied(const geometry_msgs::msg::PointStamped & point) override;
   bool is_path_traversable(const std::vector<geometry_msgs::msg::PointStamped> & path) override;
+  bool is_unknown(const geometry_msgs::msg::PointStamped & point);
 
   geometry_msgs::msg::PointStamped closest_free_point(
     const geometry_msgs::msg::PointStamped & start,
@@ -95,6 +96,11 @@ private:
   void occ_grid_cbk(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
 
   // Helpers methods
+  bool cell_in_map(const Point2i & cell) const;
+  int occupancy_value(const Point2i & cell) const;
+  bool is_unknown_cell(const Point2i & cell) const;
+  bool is_known_free_cell(const Point2i & cell);
+
   std::vector<geometry_msgs::msg::PointStamped> bresenham_line(
     const geometry_msgs::msg::PointStamped & start,
     const geometry_msgs::msg::PointStamped & end);
