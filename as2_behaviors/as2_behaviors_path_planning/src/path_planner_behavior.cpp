@@ -114,6 +114,11 @@ bool PathPlannerBehavior::on_activate(
   RCLCPP_INFO(
     this->get_logger(), "Activating Path Planner Behavior to point [%.2f, %.2f, %.2f]",
     goal->point.point.x, goal->point.point.y, goal->point.point.z);
+
+  original_goal_ = *goal;
+  is_intermediate_goal_ = false;
+  need_replan_ = false;
+
   bool ret = path_planner_plugin_->on_activate(drone_pose_, *goal);
   if (!ret) {
     bool occupied = path_planner_plugin_->is_occupied(goal->point);
@@ -150,6 +155,7 @@ bool PathPlannerBehavior::on_activate(
           "Path planner plugin failed to activate even with alternative goal point. Aborting.");
         return false;
       }
+      is_intermediate_goal_ = true;
     } else {
       return false;
     }
@@ -266,6 +272,12 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
     return as2_behavior::ExecutionStatus::FAILURE;
   }
 
+  if (need_replan_) {
+    need_replan_ = false;
+    trigger_replan();
+    return as2_behavior::ExecutionStatus::RUNNING;
+  }
+
   // TODO(pariaspe): current feedback is just a template
   if (!follow_path_feedback_) {
     RCLCPP_INFO(this->get_logger(), "Waiting for feedback from FollowPath behavior");
@@ -334,9 +346,104 @@ void PathPlannerBehavior::follow_path_result_cbk(
       return;
   }
 
+  if (is_intermediate_goal_) {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Frontier waypoint reached. Triggering replan to original goal [%.2f, %.2f, %.2f].",
+      original_goal_.point.point.x, original_goal_.point.point.y,
+      original_goal_.point.point.z);
+    need_replan_ = true;
+  } else {
+    RCLCPP_INFO(
+      this->get_logger(), "Follow Path succeeded. Goal point reached. Navigation succeeded.");
+    follow_path_succeeded_ = true;
+  }
+}
+
+void PathPlannerBehavior::trigger_replan()
+{
+  follow_path_succeeded_ = false;
+  follow_path_rejected_ = false;
+  follow_path_feedback_.reset();
+  is_intermediate_goal_ = false;
+
   RCLCPP_INFO(
-    this->get_logger(), "Follow Path succeeded. Goal point reached. Navigation succeeded.");
-  follow_path_succeeded_ = true;
+    this->get_logger(), "Replanning to original goal [%.2f, %.2f, %.2f]",
+    original_goal_.point.point.x, original_goal_.point.point.y,
+    original_goal_.point.point.z);
+
+  bool ret = path_planner_plugin_->on_activate(drone_pose_, original_goal_);
+  if (!ret) {
+    bool occupied = path_planner_plugin_->is_occupied(original_goal_.point);
+    if (occupied) {
+      geometry_msgs::msg::PointStamped drone_point;
+      drone_point.header.frame_id = "earth";
+      drone_point.header.stamp = this->get_clock()->now();
+      drone_point.point = drone_pose_.pose.position;
+
+      geometry_msgs::msg::PointStamped new_frontier =
+        path_planner_plugin_->closest_free_point(drone_point, original_goal_.point);
+
+      if (
+        new_frontier.point.x == drone_point.point.x &&
+        new_frontier.point.y == drone_point.point.y &&
+        new_frontier.point.z == drone_point.point.z)
+      {
+        RCLCPP_ERROR(
+          this->get_logger(), "Replan: no frontier found. Aborting navigation.");
+        navigation_aborted_ = true;
+        return;
+      }
+
+      RCLCPP_INFO(
+        this->get_logger(), "Replan: new frontier at [%.2f, %.2f, %.2f]",
+        new_frontier.point.x, new_frontier.point.y, new_frontier.point.z);
+
+      as2_msgs::action::NavigateToPoint::Goal frontier_goal;
+      frontier_goal.point            = new_frontier;
+      frontier_goal.yaw              = original_goal_.yaw;
+      frontier_goal.navigation_speed = original_goal_.navigation_speed;
+
+      ret = path_planner_plugin_->on_activate(drone_pose_, frontier_goal);
+      if (ret) {
+        is_intermediate_goal_ = true;
+      }
+    }
+  }
+
+  if (!ret) {
+    RCLCPP_ERROR(this->get_logger(), "Replan failed. Aborting navigation.");
+    navigation_aborted_ = true;
+    return;
+  }
+
+  path_ = path_planner_plugin_->path_;
+
+  auto goal_msg = as2_msgs::action::FollowPath::Goal();
+  goal_msg.header.frame_id = "earth";
+  goal_msg.header.stamp = this->get_clock()->now();
+  goal_msg.yaw = original_goal_.yaw;
+  goal_msg.max_speed = original_goal_.navigation_speed;
+  int i = 0;
+  for (auto & p : path_) {
+    as2_msgs::msg::PoseWithID pid;
+    pid.id = std::to_string(i++);
+    pid.pose.position = p;
+    pid.pose.position.z = original_goal_.point.point.z;
+    goal_msg.path.push_back(pid);
+  }
+
+  auto send_goal_options =
+    rclcpp_action::Client<as2_msgs::action::FollowPath>::SendGoalOptions();
+  send_goal_options.goal_response_callback = std::bind(
+    &PathPlannerBehavior::follow_path_response_cbk, this, std::placeholders::_1);
+  send_goal_options.feedback_callback = std::bind(
+    &PathPlannerBehavior::follow_path_feedback_cbk, this,
+    std::placeholders::_1, std::placeholders::_2);
+  send_goal_options.result_callback = std::bind(
+    &PathPlannerBehavior::follow_path_result_cbk, this, std::placeholders::_1);
+
+  follow_path_client_->async_send_goal(goal_msg, send_goal_options);
 }
 
 #include "rclcpp_components/register_node_macro.hpp"

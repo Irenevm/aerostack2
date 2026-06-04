@@ -84,6 +84,11 @@ private:
   bool follow_path_rejected_ = false;
   bool follow_path_succeeded_ = false;
 
+  // Reactive re-navigation loop
+  as2_msgs::action::NavigateToPoint::Goal original_goal_;
+  bool is_intermediate_goal_ = false;
+  bool need_replan_ = false;
+
 private:
   /** As2 Behavior methods **/
   bool on_activate(std::shared_ptr<const as2_msgs::action::NavigateToPoint::Goal> goal) override;
@@ -126,6 +131,8 @@ private:
 
 private:
   void drone_pose_cbk(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
+
+  void trigger_replan();
 
   // FollowPath Action Client
   void follow_path_response_cbk(
