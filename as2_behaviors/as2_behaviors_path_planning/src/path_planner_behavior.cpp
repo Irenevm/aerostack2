@@ -419,6 +419,48 @@ void PathPlannerBehavior::trigger_replan()
 
   path_ = path_planner_plugin_->path_;
 
+  // Remove leading waypoints that are within DEAD_ZONE of the drone's current
+  // position. RDP path simplification can place the first anchor point only
+  // ~0.1 m behind the drone; FollowPath then drives the drone backward before
+  // continuing forward, producing the observed sharp heading reversal.
+  // A DEAD_ZONE of 0.4 m catches these artifacts while preserving legitimate
+  // obstacle-avoidance waypoints that are farther away.
+  constexpr double DEAD_ZONE = 0.4;
+  while (path_.size() > 1) {
+    const auto & wp = path_.front();
+    double dx = wp.x - drone_pose_.pose.position.x;
+    double dy = wp.y - drone_pose_.pose.position.y;
+    if (std::sqrt(dx * dx + dy * dy) < DEAD_ZONE) {
+      path_.erase(path_.begin());
+    } else {
+      break;
+    }
+  }
+  path_.insert(path_.begin(), drone_pose_.pose.position);
+
+  // ── DIAGNOSTIC BLOCK ────────────────────────────────────────────────────
+  RCLCPP_INFO(
+    this->get_logger(),
+    "[DIAG replan] Drone pos at replan : [%.3f, %.3f, %.3f]",
+    drone_pose_.pose.position.x,
+    drone_pose_.pose.position.y,
+    drone_pose_.pose.position.z);
+  RCLCPP_INFO(
+    this->get_logger(),
+    "[DIAG replan] Path type           : %s | waypoints: %zu",
+    is_intermediate_goal_ ? "FRONTIER" : "DIRECT-TO-GOAL",
+    path_.size());
+  for (size_t k = 0; k < path_.size(); ++k) {
+    const auto & wp = path_[k];
+    double dx = wp.x - drone_pose_.pose.position.x;
+    double dy = wp.y - drone_pose_.pose.position.y;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[DIAG replan] Waypoint[%zu/%zu] : [%.3f, %.3f] | delta_drone->[%.3f, %.3f]",
+      k, path_.size() - 1, wp.x, wp.y, dx, dy);
+  }
+  // ── END DIAGNOSTIC ──────────────────────────────────────────────────────
+
   auto goal_msg = as2_msgs::action::FollowPath::Goal();
   goal_msg.header.frame_id = "earth";
   goal_msg.header.stamp = this->get_clock()->now();
