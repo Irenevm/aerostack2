@@ -118,6 +118,7 @@ bool PathPlannerBehavior::on_activate(
   original_goal_ = *goal;
   is_intermediate_goal_ = false;
   need_replan_ = false;
+  replan_count_ = 0;
 
   bool ret = path_planner_plugin_->on_activate(drone_pose_, *goal);
   if (!ret) {
@@ -367,6 +368,15 @@ void PathPlannerBehavior::trigger_replan()
   follow_path_feedback_.reset();
   is_intermediate_goal_ = false;
 
+  constexpr int MAX_REPLANS = 15;
+  if (++replan_count_ > MAX_REPLANS) {
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "Replan: exceeded %d replans without reaching goal. Aborting navigation.", MAX_REPLANS);
+    navigation_aborted_ = true;
+    return;
+  }
+
   RCLCPP_INFO(
     this->get_logger(), "Replanning to original goal [%.2f, %.2f, %.2f]",
     original_goal_.point.point.x, original_goal_.point.point.y,
@@ -398,6 +408,43 @@ void PathPlannerBehavior::trigger_replan()
       RCLCPP_INFO(
         this->get_logger(), "Replan: new frontier at [%.2f, %.2f, %.2f]",
         new_frontier.point.x, new_frontier.point.y, new_frontier.point.z);
+
+      // Abort if the frontier is farther from the goal than the drone itself.
+      // This means closest_free_point() found a cell on the wrong side of an
+      // obstacle — continuing would drive the drone away from the goal.
+      double dist_drone_to_goal = std::hypot(
+        drone_pose_.pose.position.x - original_goal_.point.point.x,
+        drone_pose_.pose.position.y - original_goal_.point.point.y);
+      double dist_frontier_to_goal = std::hypot(
+        new_frontier.point.x - original_goal_.point.point.x,
+        new_frontier.point.y - original_goal_.point.point.y);
+      constexpr double FRONTIER_MARGIN = 0.5;
+      if (dist_frontier_to_goal > dist_drone_to_goal + FRONTIER_MARGIN) {
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Replan: frontier [%.2f, %.2f] is farther from goal than drone "
+          "(frontier=%.2fm, drone=%.2fm, margin=%.1fm). Aborting navigation.",
+          new_frontier.point.x, new_frontier.point.y,
+          dist_frontier_to_goal, dist_drone_to_goal, FRONTIER_MARGIN);
+        navigation_aborted_ = true;
+        return;
+      }
+
+      // Abort if the frontier is too close to the drone — the drone is already
+      // at the nearest reachable cell and keeps replanning to the same spot.
+      double dist_drone_to_frontier = std::hypot(
+        drone_pose_.pose.position.x - new_frontier.point.x,
+        drone_pose_.pose.position.y - new_frontier.point.y);
+      constexpr double MIN_FRONTIER_DIST = 0.5;
+      if (dist_drone_to_frontier < MIN_FRONTIER_DIST) {
+        RCLCPP_ERROR(
+          this->get_logger(),
+          "Replan: frontier [%.2f, %.2f] is only %.3fm away — drone is stuck at "
+          "the closest reachable cell. Aborting navigation.",
+          new_frontier.point.x, new_frontier.point.y, dist_drone_to_frontier);
+        navigation_aborted_ = true;
+        return;
+      }
 
       as2_msgs::action::NavigateToPoint::Goal frontier_goal;
       frontier_goal.point            = new_frontier;

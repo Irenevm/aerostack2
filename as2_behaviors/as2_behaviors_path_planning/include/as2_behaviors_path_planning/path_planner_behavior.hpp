@@ -88,6 +88,7 @@ private:
   as2_msgs::action::NavigateToPoint::Goal original_goal_;
   bool is_intermediate_goal_ = false;
   bool need_replan_ = false;
+  int replan_count_ = 0;
 
 private:
   /** As2 Behavior methods **/
