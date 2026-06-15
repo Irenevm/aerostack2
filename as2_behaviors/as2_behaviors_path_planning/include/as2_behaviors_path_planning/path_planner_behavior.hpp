@@ -89,6 +89,7 @@ private:
   bool is_intermediate_goal_ = false;
   bool need_replan_ = false;
   int replan_count_ = 0;
+  int max_replans_ = 15;
 
 private:
   /** As2 Behavior methods **/

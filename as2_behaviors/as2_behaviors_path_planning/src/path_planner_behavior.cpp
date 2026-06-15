@@ -69,6 +69,9 @@ PathPlannerBehavior::PathPlannerBehavior(const rclcpp::NodeOptions & options)
   this->declare_parameter("dist_to_line_threshold", 1.0);
   dist_to_line_threshold_ = this->get_parameter("dist_to_line_threshold").as_double();
 
+  this->declare_parameter("max_replans", 15);
+  max_replans_ = this->get_parameter("max_replans").as_int();
+
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
@@ -368,11 +371,10 @@ void PathPlannerBehavior::trigger_replan()
   follow_path_feedback_.reset();
   is_intermediate_goal_ = false;
 
-  constexpr int MAX_REPLANS = 15;
-  if (++replan_count_ > MAX_REPLANS) {
+  if (++replan_count_ > max_replans_) {
     RCLCPP_ERROR(
       this->get_logger(),
-      "Replan: exceeded %d replans without reaching goal. Aborting navigation.", MAX_REPLANS);
+      "Replan: exceeded %d replans without reaching goal. Aborting navigation.", max_replans_);
     navigation_aborted_ = true;
     return;
   }

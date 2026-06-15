@@ -45,7 +45,7 @@ from as2_gazebo_assets.world import spawn_args, World
 
 from launch import LaunchContext, LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, \
-    RegisterEventHandler
+    RegisterEventHandler, TimerAction
 from launch.actions import EmitEvent, ExecuteProcess
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
@@ -190,8 +190,9 @@ def launch_simulation(context: LaunchContext):
         world, 'world_path') else world.world_name
     launch_processes.extend(simulation(
         world_to_load, gui_config_file, headless, verbose, run_on_start))
-    launch_processes.extend(spawn(world))
-    launch_processes.extend(world_bridges() + object_bridges())
+    # Delay spawn until Gazebo has fully loaded the world and exposed its services
+    spawn_actions = spawn(world) + world_bridges() + object_bridges()
+    launch_processes.append(TimerAction(period=5.0, actions=spawn_actions))
     return launch_processes
 
 
