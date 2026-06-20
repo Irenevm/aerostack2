@@ -91,6 +91,10 @@ private:
   int replan_count_ = 0;
   int max_replans_ = 15;
 
+  // Periodic map-check: detect when direct path to goal becomes available
+  rclcpp::TimerBase::SharedPtr map_check_timer_;
+  bool check_map_ = false;
+
 private:
   /** As2 Behavior methods **/
   bool on_activate(std::shared_ptr<const as2_msgs::action::NavigateToPoint::Goal> goal) override;

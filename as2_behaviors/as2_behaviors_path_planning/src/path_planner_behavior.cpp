@@ -72,6 +72,13 @@ PathPlannerBehavior::PathPlannerBehavior(const rclcpp::NodeOptions & options)
   this->declare_parameter("max_replans", 15);
   max_replans_ = this->get_parameter("max_replans").as_int();
 
+  this->declare_parameter("map_check_period", 2.0);
+  double map_check_period = this->get_parameter("map_check_period").as_double();
+  map_check_timer_ = this->create_wall_timer(
+    std::chrono::duration<double>(map_check_period),
+    [this]() { check_map_ = true; });
+  map_check_timer_->cancel();
+
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
@@ -122,6 +129,8 @@ bool PathPlannerBehavior::on_activate(
   is_intermediate_goal_ = false;
   need_replan_ = false;
   replan_count_ = 0;
+  check_map_ = false;
+  map_check_timer_->reset();
 
   bool ret = path_planner_plugin_->on_activate(drone_pose_, *goal);
   if (!ret) {
@@ -221,6 +230,7 @@ bool PathPlannerBehavior::on_modify(
 bool PathPlannerBehavior::on_deactivate(const std::shared_ptr<std::string> & message)
 {
   RCLCPP_INFO(this->get_logger(), "Received request to cancel goal");
+  map_check_timer_->cancel();
   // Cancel only the goal started from navigation. Behaviors only accepts
   // one goal simultaneously, don't have to worry about
   follow_path_client_->async_cancel_all_goals();
@@ -280,6 +290,22 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
     need_replan_ = false;
     trigger_replan();
     return as2_behavior::ExecutionStatus::RUNNING;
+  }
+
+  if (check_map_) {
+    check_map_ = false;
+    if (is_intermediate_goal_) {
+      bool direct = path_planner_plugin_->on_activate(drone_pose_, original_goal_);
+      if (direct) {
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[MAP_CHECK] Direct path to goal [%.2f, %.2f] now available. Replanning.",
+          original_goal_.point.point.x, original_goal_.point.point.y);
+        follow_path_client_->async_cancel_all_goals();
+        is_intermediate_goal_ = false;
+        need_replan_ = true;
+      }
+    }
   }
 
   // TODO(pariaspe): current feedback is just a template

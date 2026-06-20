@@ -8,3 +8,4 @@
     dist_to_line_threshold: 0.0 # Max distance for a point to be considered contained by a straight line
     same_goal_tolerance: 0.05 # XY tolerance [m] to consider two goals equivalent
     max_replans: 15  # Maximum number of reactive replans before aborting navigation
+    map_check_period: 2  # Seconds between checks for a direct path to the goal [s]
