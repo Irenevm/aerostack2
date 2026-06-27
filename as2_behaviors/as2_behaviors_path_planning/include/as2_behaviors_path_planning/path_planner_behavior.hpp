@@ -94,6 +94,10 @@ private:
   // Periodic map-check: detect when direct path to goal becomes available
   rclcpp::TimerBase::SharedPtr map_check_timer_;
   bool check_map_ = false;
+  geometry_msgs::msg::PoseStamped pose_at_plan_start_;
+  // Set when MAP_CHECK cancels FollowPath; replan fires only after cancel is confirmed
+  // to avoid cancel_all_goals() killing the newly-sent FollowPath goal.
+  bool waiting_for_map_check_replan_ = false;
 
 private:
   /** As2 Behavior methods **/

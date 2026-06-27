@@ -130,6 +130,8 @@ bool PathPlannerBehavior::on_activate(
   need_replan_ = false;
   replan_count_ = 0;
   check_map_ = false;
+  waiting_for_map_check_replan_ = false;
+  pose_at_plan_start_ = drone_pose_;
   map_check_timer_->reset();
 
   bool ret = path_planner_plugin_->on_activate(drone_pose_, *goal);
@@ -231,6 +233,7 @@ bool PathPlannerBehavior::on_deactivate(const std::shared_ptr<std::string> & mes
 {
   RCLCPP_INFO(this->get_logger(), "Received request to cancel goal");
   map_check_timer_->cancel();
+  waiting_for_map_check_replan_ = false;
   // Cancel only the goal started from navigation. Behaviors only accepts
   // one goal simultaneously, don't have to worry about
   follow_path_client_->async_cancel_all_goals();
@@ -282,8 +285,24 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
   std::shared_ptr<as2_msgs::action::NavigateToPoint::Feedback> & feedback_msg,
   std::shared_ptr<as2_msgs::action::NavigateToPoint::Result> & result_msg)
 {
-  if (follow_path_rejected_ || navigation_aborted_) {
+  if (navigation_aborted_) {
     return as2_behavior::ExecutionStatus::FAILURE;
+  }
+
+  // FollowPath server rejected the goal (busy after a cancel). Retry by
+  // replanning: the server will be free by the next on_run cycle.
+  if (follow_path_rejected_) {
+    follow_path_rejected_ = false;
+    if (replan_count_ <= max_replans_) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "FollowPath rejected by server — retrying replan (%d/%d).", replan_count_, max_replans_);
+      need_replan_ = true;
+    } else {
+      RCLCPP_ERROR(this->get_logger(), "FollowPath rejected after max replans. Aborting.");
+      result_msg->success = false;
+      return as2_behavior::ExecutionStatus::FAILURE;
+    }
   }
 
   if (need_replan_) {
@@ -294,18 +313,88 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
 
   if (check_map_) {
     check_map_ = false;
-    if (is_intermediate_goal_) {
-      bool direct = path_planner_plugin_->on_activate(drone_pose_, original_goal_);
-      if (direct) {
-        RCLCPP_INFO(
-          this->get_logger(),
-          "[MAP_CHECK] Direct path to goal [%.2f, %.2f] now available. Replanning.",
-          original_goal_.point.point.x, original_goal_.point.point.y);
-        follow_path_client_->async_cancel_all_goals();
-        is_intermediate_goal_ = false;
-        need_replan_ = true;
+    // Run A* to update the internal graph with the current map, and check
+    // whether the original goal is directly reachable from here.
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[MAP_CHECK] tick — drone=[%.2f, %.2f] intermediate=%s",
+      drone_pose_.pose.position.x, drone_pose_.pose.position.y,
+      is_intermediate_goal_ ? "true" : "false");
+    bool can_reach_goal = path_planner_plugin_->on_activate(drone_pose_, original_goal_);
+
+    if (can_reach_goal && is_intermediate_goal_) {
+      // Hito A: direct path to goal became available mid-flight to frontier.
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[MAP_CHECK] Direct path to goal [%.2f, %.2f] now available. Replanning.",
+        original_goal_.point.point.x, original_goal_.point.point.y);
+      is_intermediate_goal_ = false;
+      follow_path_client_->async_cancel_all_goals();
+      waiting_for_map_check_replan_ = true;
+    } else if (!can_reach_goal && !is_intermediate_goal_) {
+      // Hito B (complete blockage): A* can no longer reach the goal at all.
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[MAP_CHECK] Path to goal [%.2f, %.2f] is now blocked. Replanning.",
+        original_goal_.point.point.x, original_goal_.point.point.y);
+      follow_path_client_->async_cancel_all_goals();
+      waiting_for_map_check_replan_ = true;
+    } else if (can_reach_goal && !is_intermediate_goal_) {
+      // Hito B (path deviation): the goal is still reachable but an obstacle
+      // may have appeared on the current FollowPath waypoints. Check waypoints
+      // that are strictly ahead of the drone and far enough to be reliable
+      // (inflation-boundary cells near the drone are noisy).
+      double dist_from_plan_start = std::hypot(
+        drone_pose_.pose.position.x - pose_at_plan_start_.pose.position.x,
+        drone_pose_.pose.position.y - pose_at_plan_start_.pose.position.y);
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[MAP_CHECK] HitoB check — dist_from_start=%.2fm (min=%.2fm) waypoints=%zu",
+        dist_from_plan_start, safety_distance_ * 3.0, path_.size());
+      if (dist_from_plan_start >= safety_distance_ * 3.0) {
+        int checked = 0, skipped_behind = 0, skipped_near = 0;
+        geometry_msgs::msg::PointStamped wp;
+        wp.header.frame_id = "earth";
+        wp.header.stamp = this->get_clock()->now();
+        for (const auto & p : path_) {
+          // Skip waypoints the drone has already passed.
+          double wp_dist_from_start = std::hypot(
+            p.x - pose_at_plan_start_.pose.position.x,
+            p.y - pose_at_plan_start_.pose.position.y);
+          if (wp_dist_from_start <= dist_from_plan_start) {
+            skipped_behind++;
+            continue;
+          }
+          // Skip waypoints too close to the drone — inflation-boundary noise.
+          double wp_dist_to_drone = std::hypot(
+            p.x - drone_pose_.pose.position.x,
+            p.y - drone_pose_.pose.position.y);
+          if (wp_dist_to_drone < safety_distance_ * 1.5) {
+            skipped_near++;
+            continue;
+          }
+          checked++;
+          wp.point = p;
+          if (path_planner_plugin_->is_occupied(wp)) {
+            RCLCPP_WARN(
+              this->get_logger(),
+              "[MAP_CHECK] Waypoint [%.2f, %.2f] is now occupied (checked=%d skip_behind=%d skip_near=%d). Replanning.",
+              p.x, p.y, checked, skipped_behind, skipped_near);
+            follow_path_client_->async_cancel_all_goals();
+            waiting_for_map_check_replan_ = true;
+            break;
+          }
+        }
+        if (!waiting_for_map_check_replan_) {
+          RCLCPP_INFO(
+            this->get_logger(),
+            "[MAP_CHECK] All waypoints free (checked=%d skip_behind=%d skip_near=%d).",
+            checked, skipped_behind, skipped_near);
+        }
       }
     }
+    // Case (!can_reach && is_intermediate): goal still blocked while exploring
+    // frontier — keep flying, no action needed.
   }
 
   // TODO(pariaspe): current feedback is just a template
@@ -367,8 +456,14 @@ void PathPlannerBehavior::follow_path_result_cbk(
       // navigation_aborted_ = true;
       return;
     case rclcpp_action::ResultCode::CANCELED:
-      RCLCPP_ERROR(this->get_logger(), "FollowPath was canceled. Cancelling navigation");
-      // navigation_aborted_ = true;
+      if (waiting_for_map_check_replan_) {
+        waiting_for_map_check_replan_ = false;
+        need_replan_ = true;
+        RCLCPP_INFO(this->get_logger(), "FollowPath canceled — triggering MAP_CHECK replan.");
+      } else {
+        RCLCPP_ERROR(this->get_logger(), "FollowPath was canceled. Cancelling navigation");
+        // navigation_aborted_ = true;
+      }
       return;
     default:
       RCLCPP_ERROR(this->get_logger(), "Unknown result code from FollowPath. Aborting navigation.");
@@ -396,6 +491,7 @@ void PathPlannerBehavior::trigger_replan()
   follow_path_rejected_ = false;
   follow_path_feedback_.reset();
   is_intermediate_goal_ = false;
+  pose_at_plan_start_ = drone_pose_;
 
   if (++replan_count_ > max_replans_) {
     RCLCPP_ERROR(
