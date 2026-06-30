@@ -29,6 +29,8 @@ set(PROJECT_DEPENDENCIES
   nav_msgs
   visualization_msgs
   tf2_ros
+  tf2_geometry_msgs
+  sensor_msgs
 )
 
 # find_package(backward_ros REQUIRED)

@@ -37,6 +37,7 @@
 #define AS2_BEHAVIORS_PATH_PLANNING__PATH_PLANNER_BEHAVIOR_HPP_
 
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -51,6 +52,8 @@
 #include "tf2_ros/transform_listener.h"
 #include "std_srvs/srv/trigger.hpp"
 #include "as2_core/synchronous_service_client.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 #include "as2_msgs/action/follow_path.hpp"
 #include "as2_behaviors_path_planning/path_planner_plugin_base.hpp"
@@ -98,6 +101,28 @@ private:
   // Set when MAP_CHECK cancels FollowPath; replan fires only after cancel is confirmed
   // to avoid cancel_all_goals() killing the newly-sent FollowPath goal.
   bool waiting_for_map_check_replan_ = false;
+
+  // ── LiDAR Reactive Safety Layer ──────────────────────────────────────────
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr lidar_scan_sub_;
+  sensor_msgs::msg::LaserScan::SharedPtr last_scan_;
+  rclcpp::TimerBase::SharedPtr lidar_check_timer_;
+  bool check_lidar_ = false;
+  bool lidar_braking_ = false;      // FollowPath is paused due to LiDAR
+  int  consecutive_detections_ = 0; // persistence counter
+  double last_sent_speed_ = 0.0;    // last max_speed sent to FollowPath (histéresis)
+  rclcpp::Time lidar_brake_time_;   // when braking started (for timeout warn)
+
+  // LiDAR safety parameters
+  bool   enable_lidar_safety_ = true;
+  double lidar_check_period_ = 0.05;
+  double lidar_danger_distance_ = 1.5;
+  double lidar_stop_distance_ = 0.7;
+  double lidar_corridor_half_width_ = 0.5;
+  int    lidar_min_cluster_size_ = 3;
+  int    lidar_persistence_count_ = 2;
+  bool   enable_lidar_decel_ = true;
+  double lidar_kp_ = 1.0;
+  double decel_speed_epsilon_ = 0.1;
 
 private:
   /** As2 Behavior methods **/
@@ -152,6 +177,20 @@ private:
     const std::shared_ptr<const as2_msgs::action::FollowPath::Feedback> feedback);
   void follow_path_result_cbk(
     const rclcpp_action::ClientGoalHandle<as2_msgs::action::FollowPath>::WrappedResult & result);
+
+  // FollowPath goal helper (eliminates duplicated goal-build/send code)
+  void send_follow_path_goal(double max_speed);
+
+  // LiDAR reactive safety
+  void lidar_scan_cbk(const sensor_msgs::msg::LaserScan::SharedPtr msg);
+  bool compute_travel_axis(geometry_msgs::msg::Vector3 & axis_out);
+  int  count_corridor_hits(
+    const sensor_msgs::msg::LaserScan & scan,
+    const geometry_msgs::msg::Vector3 & axis,
+    double & nearest_along_out);
+  bool evaluate_lidar_corridor(double & nearest_along);
+  void engage_lidar_brake();
+  double compute_safe_speed(double d) const;
 };
 
 #endif  // AS2_BEHAVIORS_PATH_PLANNING__PATH_PLANNER_BEHAVIOR_HPP_
