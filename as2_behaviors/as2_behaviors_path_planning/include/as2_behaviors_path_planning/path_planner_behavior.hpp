@@ -86,6 +86,10 @@ private:
   std::shared_ptr<const as2_msgs::action::FollowPath::Feedback> follow_path_feedback_;
   bool follow_path_rejected_ = false;
   bool follow_path_succeeded_ = false;
+  // True between an accepted FollowPath goal response and its result callback.
+  // Gates whether a replan can use the "modify" service (in-place waypoint
+  // update on the running goal) instead of cancel + brand-new goal.
+  bool follow_path_active_ = false;
 
   // Reactive re-navigation loop
   as2_msgs::action::NavigateToPoint::Goal original_goal_;
@@ -160,6 +164,11 @@ private:
     nullptr;
   as2::SynchronousServiceClient<std_srvs::srv::Trigger>::SharedPtr follow_path_resume_client_ =
     nullptr;
+  // Updates the running FollowPath goal's waypoints in place (no cancel, no
+  // stop-and-restart): calls own_modify() on the plugin instead of tearing
+  // down and resending the whole action goal.
+  as2::SynchronousServiceClient<as2_msgs::action::FollowPath::Impl::SendGoalService>::SharedPtr
+    follow_path_modify_client_ = nullptr;
 
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -180,6 +189,11 @@ private:
 
   // FollowPath goal helper (eliminates duplicated goal-build/send code)
   void send_follow_path_goal(double max_speed);
+
+  // Builds the same goal message as send_follow_path_goal() but sends it
+  // through the "modify" service instead of the action client, so the
+  // running goal is updated in place. Returns whether the plugin accepted it.
+  bool send_follow_path_modify(double max_speed);
 
   // LiDAR reactive safety
   void lidar_scan_cbk(const sensor_msgs::msg::LaserScan::SharedPtr msg);

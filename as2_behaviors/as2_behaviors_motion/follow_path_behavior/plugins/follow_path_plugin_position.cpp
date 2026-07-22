@@ -77,25 +77,31 @@ public:
 
   bool own_modify(as2_msgs::action::FollowPath::Goal & _goal) override
   {
-    RCLCPP_INFO(node_ptr_->get_logger(), "Follow path modiy accepted");
+    RCLCPP_INFO(node_ptr_->get_logger(), "Follow path modify accepted");
     RCLCPP_INFO(node_ptr_->get_logger(), "Follow path with speed: %f", _goal.max_speed);
     RCLCPP_INFO(node_ptr_->get_logger(), "Follow path with yaw mode: %d", _goal.yaw.mode);
 
-    for (auto & point : _goal.path) {
-      if (std::find(path_ids_.begin(), path_ids_.end(), point.id) != path_ids_.end()) {
-        RCLCPP_INFO(
-          node_ptr_->get_logger(), "Follow path modify point %s: %f, %f, %f",
-          point.id.c_str(), point.pose.position.x, point.pose.position.y,
-          point.pose.position.z);
-      } else {
-        RCLCPP_INFO(
-          node_ptr_->get_logger(), "Follow path add point %s: %f, %f, %f",
-          point.id.c_str(), point.pose.position.x, point.pose.position.y,
-          point.pose.position.z);
-        path_ids_.push_back(point.id);
-        path_ids_remaining_.push_back(point.id);
-      }
+    if (_goal.path.empty()) {
+      RCLCPP_WARN(node_ptr_->get_logger(), "Follow path modify rejected: empty path");
+      return false;
     }
+
+    // Replace the pending queue wholesale instead of merging by id: replans build
+    // their path from scratch and reuse small sequential ids ("0", "1", ...), so
+    // matching by id against the old queue can silently keep stale waypoints that
+    // are no longer part of the new plan (they sit behind/ahead of the drone
+    // forever) or drop updates to ids already popped from path_ids_remaining_.
+    path_ids_.clear();
+    path_ids_remaining_.clear();
+    for (auto & point : _goal.path) {
+      RCLCPP_INFO(
+        node_ptr_->get_logger(), "Follow path modify to point %s: %f, %f, %f",
+        point.id.c_str(), point.pose.position.x, point.pose.position.y,
+        point.pose.position.z);
+      path_ids_.push_back(point.id);
+    }
+    path_ids_remaining_ = path_ids_;
+
     initial_yaw_ = as2::frame::getYawFromQuaternion(actual_pose_.pose.orientation);
     updateDesiredPose(_goal, path_ids_remaining_[0]);
     feedback_.next_waypoint_id = path_ids_remaining_.front();

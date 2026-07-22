@@ -162,6 +162,10 @@ PathPlannerBehavior::PathPlannerBehavior(const rclcpp::NodeOptions & options)
   follow_path_resume_client_ =
     std::make_shared<as2::SynchronousServiceClient<std_srvs::srv::Trigger>>(
     std::string(as2_names::actions::behaviors::followpath) + "/_behavior/resume", this);
+
+  follow_path_modify_client_ = std::make_shared<as2::SynchronousServiceClient<
+      as2_msgs::action::FollowPath::Impl::SendGoalService>>(
+    std::string(as2_names::actions::behaviors::followpath) + "/_behavior/modify", this);
 }
 
 bool PathPlannerBehavior::on_activate(
@@ -177,6 +181,7 @@ bool PathPlannerBehavior::on_activate(
   replan_count_ = 0;
   check_map_ = false;
   waiting_for_map_check_replan_ = false;
+  follow_path_active_ = false;
   pose_at_plan_start_ = drone_pose_;
   map_check_timer_->reset();
 
@@ -270,6 +275,7 @@ bool PathPlannerBehavior::on_deactivate(const std::shared_ptr<std::string> & mes
   // Cancel only the goal started from navigation. Behaviors only accepts
   // one goal simultaneously, don't have to worry about
   follow_path_client_->async_cancel_all_goals();
+  follow_path_active_ = false;
   navigation_aborted_ = true;
   return true;
 }
@@ -442,16 +448,18 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
         "[MAP_CHECK] Direct path to goal [%.2f, %.2f] now available (dist=%.1fm). Replanning.",
         original_goal_.point.point.x, original_goal_.point.point.y, dist_to_original_goal);
       is_intermediate_goal_ = false;
-      follow_path_client_->async_cancel_all_goals();
+      // Replan in place via trigger_replan() -> modify(): no cancel, the drone
+      // keeps flying its current segment until the new path takes effect.
       waiting_for_map_check_replan_ = true;
+      need_replan_ = true;
     } else if (!can_reach_goal && !is_intermediate_goal_) {
       // Hito B (complete blockage): A* can no longer reach the goal at all.
       RCLCPP_WARN(
         this->get_logger(),
         "[MAP_CHECK] Path to goal [%.2f, %.2f] is now blocked. Replanning.",
         original_goal_.point.point.x, original_goal_.point.point.y);
-      follow_path_client_->async_cancel_all_goals();
       waiting_for_map_check_replan_ = true;
+      need_replan_ = true;
     } else if (can_reach_goal && !is_intermediate_goal_ && !waiting_for_map_check_replan_) {
       // Hito B (path segment check): we're on the direct path — sample every segment
       // between consecutive waypoints to detect obstacles that fall between RDP-reduced
@@ -497,8 +505,8 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
                 this->get_logger(),
                 "[MAP_CHECK] Path segment occupied at [%.2f, %.2f] (segment %zu/%zu). Replanning.",
                 sx, sy, i + 1, path_.size() - 1);
-              follow_path_client_->async_cancel_all_goals();
               waiting_for_map_check_replan_ = true;
+              need_replan_ = true;
               occupied_found = true;
             }
           }
@@ -545,6 +553,7 @@ void PathPlannerBehavior::follow_path_response_cbk(
     follow_path_rejected_ = true;
   } else {
     RCLCPP_INFO(this->get_logger(), "FollowPath accepted, flying to point.");
+    follow_path_active_ = true;
   }
 }
 
@@ -564,6 +573,11 @@ void PathPlannerBehavior::follow_path_feedback_cbk(
 void PathPlannerBehavior::follow_path_result_cbk(
   const rclcpp_action::ClientGoalHandle<as2_msgs::action::FollowPath>::WrappedResult & result)
 {
+  // Any result means this goal is no longer running (modify() never produces
+  // one, since it updates the same goal in place without going through the
+  // action client).
+  follow_path_active_ = false;
+
   switch (result.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
       break;
@@ -607,6 +621,7 @@ void PathPlannerBehavior::trigger_replan()
   follow_path_rejected_ = false;
   follow_path_feedback_.reset();
   is_intermediate_goal_ = false;
+  waiting_for_map_check_replan_ = false;
   pose_at_plan_start_ = drone_pose_;
 
   // Reset LiDAR safety state so the new FollowPath goal starts unbraked
@@ -618,6 +633,10 @@ void PathPlannerBehavior::trigger_replan()
     RCLCPP_ERROR(
       this->get_logger(),
       "Replan: exceeded %d replans without reaching goal. Aborting navigation.", max_replans_);
+    if (follow_path_active_) {
+      follow_path_client_->async_cancel_all_goals();
+      follow_path_active_ = false;
+    }
     navigation_aborted_ = true;
     return;
   }
@@ -646,6 +665,10 @@ void PathPlannerBehavior::trigger_replan()
       {
         RCLCPP_ERROR(
           this->get_logger(), "Replan: no frontier found. Aborting navigation.");
+        if (follow_path_active_) {
+          follow_path_client_->async_cancel_all_goals();
+          follow_path_active_ = false;
+        }
         navigation_aborted_ = true;
         return;
       }
@@ -671,6 +694,10 @@ void PathPlannerBehavior::trigger_replan()
           "(frontier=%.2fm, drone=%.2fm, margin=%.1fm). Aborting navigation.",
           new_frontier.point.x, new_frontier.point.y,
           dist_frontier_to_goal, dist_drone_to_goal, FRONTIER_MARGIN);
+        if (follow_path_active_) {
+          follow_path_client_->async_cancel_all_goals();
+          follow_path_active_ = false;
+        }
         navigation_aborted_ = true;
         return;
       }
@@ -687,6 +714,10 @@ void PathPlannerBehavior::trigger_replan()
           "Replan: frontier [%.2f, %.2f] is only %.3fm away — drone is stuck at "
           "the closest reachable cell. Aborting navigation.",
           new_frontier.point.x, new_frontier.point.y, dist_drone_to_frontier);
+        if (follow_path_active_) {
+          follow_path_client_->async_cancel_all_goals();
+          follow_path_active_ = false;
+        }
         navigation_aborted_ = true;
         return;
       }
@@ -705,6 +736,10 @@ void PathPlannerBehavior::trigger_replan()
 
   if (!ret) {
     RCLCPP_ERROR(this->get_logger(), "Replan failed. Aborting navigation.");
+    if (follow_path_active_) {
+      follow_path_client_->async_cancel_all_goals();
+      follow_path_active_ = false;
+    }
     navigation_aborted_ = true;
     return;
   }
@@ -753,7 +788,26 @@ void PathPlannerBehavior::trigger_replan()
   }
   // ── END DIAGNOSTIC ──────────────────────────────────────────────────────
 
-  send_follow_path_goal(original_goal_.navigation_speed);
+  // If FollowPath is already flying a goal, update its waypoints in place via
+  // the "modify" service — no cancel, no stop-and-restart, so the drone keeps
+  // moving while the new path takes effect. Only fall back to a fresh
+  // cancel+send when there's no running goal to modify (first activation,
+  // previous goal was rejected, or it already finished) or the plugin
+  // rejects the modify outright.
+  bool replanned_in_place = false;
+  if (follow_path_active_) {
+    replanned_in_place = send_follow_path_modify(original_goal_.navigation_speed);
+    if (!replanned_in_place) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "FollowPath modify rejected — falling back to cancel + resend.");
+      follow_path_client_->async_cancel_all_goals();
+      follow_path_active_ = false;
+    }
+  }
+  if (!replanned_in_place) {
+    send_follow_path_goal(original_goal_.navigation_speed);
+  }
   last_sent_speed_ = original_goal_.navigation_speed;
 }
 
@@ -786,6 +840,29 @@ void PathPlannerBehavior::send_follow_path_goal(double max_speed)
     &PathPlannerBehavior::follow_path_result_cbk, this, std::placeholders::_1);
 
   follow_path_client_->async_send_goal(goal_msg, send_goal_options);
+}
+
+bool PathPlannerBehavior::send_follow_path_modify(double max_speed)
+{
+  auto goal_msg = as2_msgs::action::FollowPath::Goal();
+  goal_msg.header.frame_id = "earth";
+  goal_msg.header.stamp = this->get_clock()->now();
+  goal_msg.yaw = original_goal_.yaw;
+  goal_msg.max_speed = static_cast<float>(max_speed);
+  int i = 0;
+  for (auto & p : path_) {
+    as2_msgs::msg::PoseWithID pid;
+    pid.id = std::to_string(i++);
+    pid.pose.position = p;
+    pid.pose.position.z = original_goal_.point.point.z;
+    goal_msg.path.push_back(pid);
+  }
+
+  as2_msgs::action::FollowPath::Impl::SendGoalService::Request req;
+  req.goal = goal_msg;
+  as2_msgs::action::FollowPath::Impl::SendGoalService::Response res;
+  bool ok = follow_path_modify_client_->sendRequest(req, res, 1);
+  return ok && res.accepted;
 }
 
 // ── LiDAR Reactive Safety Layer ───────────────────────────────────────────
