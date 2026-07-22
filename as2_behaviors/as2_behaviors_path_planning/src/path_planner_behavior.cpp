@@ -83,48 +83,6 @@ PathPlannerBehavior::PathPlannerBehavior(const rclcpp::NodeOptions & options)
     [this]() { check_map_ = true; });
   map_check_timer_->cancel();
 
-  // ── LiDAR Reactive Safety Layer parameters ─────────────────────────────
-  this->declare_parameter("enable_lidar_safety", true);
-  enable_lidar_safety_ = this->get_parameter("enable_lidar_safety").as_bool();
-
-  this->declare_parameter("lidar_check_period", 0.05);
-  double lidar_check_period = this->get_parameter("lidar_check_period").as_double();
-
-  this->declare_parameter("lidar_danger_distance", 1.5);
-  lidar_danger_distance_ = this->get_parameter("lidar_danger_distance").as_double();
-
-  this->declare_parameter("lidar_stop_distance", 0.7);
-  lidar_stop_distance_ = this->get_parameter("lidar_stop_distance").as_double();
-
-  this->declare_parameter("lidar_corridor_half_width", 0.5);
-  lidar_corridor_half_width_ = this->get_parameter("lidar_corridor_half_width").as_double();
-
-  this->declare_parameter("lidar_min_cluster_size", 3);
-  lidar_min_cluster_size_ = this->get_parameter("lidar_min_cluster_size").as_int();
-
-  this->declare_parameter("lidar_persistence_count", 2);
-  lidar_persistence_count_ = this->get_parameter("lidar_persistence_count").as_int();
-
-  this->declare_parameter("enable_lidar_decel", true);
-  enable_lidar_decel_ = this->get_parameter("enable_lidar_decel").as_bool();
-
-  this->declare_parameter("lidar_kp", 1.0);
-  lidar_kp_ = this->get_parameter("lidar_kp").as_double();
-
-  this->declare_parameter("decel_speed_epsilon", 0.1);
-  decel_speed_epsilon_ = this->get_parameter("decel_speed_epsilon").as_double();
-
-  lidar_check_timer_ = this->create_wall_timer(
-    std::chrono::duration<double>(lidar_check_period),
-    [this]() { check_lidar_ = true; });
-  lidar_check_timer_->cancel();
-
-  lidar_scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-    "sensor_measurements/lidar/scan",
-    rclcpp::SensorDataQoS(),
-    std::bind(&PathPlannerBehavior::lidar_scan_cbk, this, std::placeholders::_1));
-  // ── end LiDAR params ───────────────────────────────────────────────────
-
   tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
   tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
@@ -185,15 +143,6 @@ bool PathPlannerBehavior::on_activate(
   pose_at_plan_start_ = drone_pose_;
   map_check_timer_->reset();
 
-  // Reset LiDAR safety state
-  check_lidar_ = false;
-  lidar_braking_ = false;
-  consecutive_detections_ = 0;
-  last_sent_speed_ = 0.0;
-  if (enable_lidar_safety_) {
-    lidar_check_timer_->reset();
-  }
-
   bool ret = path_planner_plugin_->on_activate(drone_pose_, *goal);
   if (!ret) {
     bool occupied = path_planner_plugin_->is_occupied(goal->point);
@@ -251,7 +200,6 @@ bool PathPlannerBehavior::on_activate(
 
   RCLCPP_INFO(this->get_logger(), "Sending goal to FollowPath behavior");
   send_follow_path_goal(goal->navigation_speed);
-  last_sent_speed_ = goal->navigation_speed;
 
   return true;
 }
@@ -267,10 +215,6 @@ bool PathPlannerBehavior::on_deactivate(const std::shared_ptr<std::string> & mes
 {
   RCLCPP_INFO(this->get_logger(), "Received request to cancel goal");
   map_check_timer_->cancel();
-  lidar_check_timer_->cancel();
-  check_lidar_ = false;
-  lidar_braking_ = false;
-  consecutive_detections_ = 0;
   waiting_for_map_check_replan_ = false;
   // Cancel only the goal started from navigation. Behaviors only accepts
   // one goal simultaneously, don't have to worry about
@@ -349,80 +293,6 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
     trigger_replan();
     return as2_behavior::ExecutionStatus::RUNNING;
   }
-
-  // ── LiDAR REACTIVE SAFETY ────────────────────────────────────────────────
-  if (check_lidar_) {
-    check_lidar_ = false;
-    if (enable_lidar_safety_ && !navigation_aborted_ &&
-        !need_replan_ && !waiting_for_map_check_replan_)
-    {
-      double nearest = std::numeric_limits<double>::infinity();
-      bool obstacle = evaluate_lidar_corridor(nearest);
-
-      if (obstacle) {
-        if (nearest <= lidar_stop_distance_) {
-          // Full stop via pause/hover
-          if (!lidar_braking_) {
-            RCLCPP_WARN(
-              get_logger(),
-              "[LIDAR_SAFETY] DETECTED — d=%.2fm ≤ stop=%.2fm → engaging brake",
-              nearest, lidar_stop_distance_);
-            engage_lidar_brake();
-          }
-        } else if (enable_lidar_decel_) {
-          // Progressive braking zone: stop_distance < nearest <= danger_distance
-          if (lidar_braking_) {
-            // Obstacle backed off from stop zone — resume before decelerating
-            std_srvs::srv::Trigger::Request req;
-            std_srvs::srv::Trigger::Response res;
-            follow_path_resume_client_->sendRequest(req, res, 1);
-            lidar_braking_ = false;
-          }
-          double v_safe = compute_safe_speed(nearest);
-          if (std::abs(v_safe - last_sent_speed_) > decel_speed_epsilon_) {
-            RCLCPP_INFO(
-              get_logger(),
-              "[LIDAR_SAFETY] DETECTED — d=%.2fm → speed %.2f→%.2f m/s",
-              nearest, last_sent_speed_, v_safe);
-            send_follow_path_goal(v_safe);
-            last_sent_speed_ = v_safe;
-          }
-        }
-      } else {
-        // Corridor clear — restore normal navigation if we were braking/decelerating
-        bool was_braking = lidar_braking_;
-        bool was_decelerating =
-          (last_sent_speed_ > 0.0 &&
-           last_sent_speed_ < original_goal_.navigation_speed - decel_speed_epsilon_);
-
-        if (was_braking || was_decelerating) {
-          if (was_braking) {
-            std_srvs::srv::Trigger::Request req;
-            std_srvs::srv::Trigger::Response res;
-            follow_path_resume_client_->sendRequest(req, res, 1);
-          }
-          lidar_braking_ = false;
-          send_follow_path_goal(original_goal_.navigation_speed);
-          last_sent_speed_ = original_goal_.navigation_speed;
-          RCLCPP_INFO(
-            get_logger(), "[LIDAR_SAFETY] Corridor clear — full speed %.2f m/s restored",
-            original_goal_.navigation_speed);
-        }
-        lidar_braking_ = false;
-      }
-
-      // Warn if braking for too long without a map_check replan
-      if (lidar_braking_) {
-        double brake_elapsed = (this->get_clock()->now() - lidar_brake_time_).seconds();
-        if (brake_elapsed > 4.0) {
-          RCLCPP_WARN_THROTTLE(
-            get_logger(), *get_clock(), 2000,
-            "[LIDAR_SAFETY] Braking for %.1fs — waiting for map_check replan.", brake_elapsed);
-        }
-      }
-    }
-  }
-  // ── END LiDAR REACTIVE SAFETY ────────────────────────────────────────────
 
   if (check_map_) {
     check_map_ = false;
@@ -624,11 +494,6 @@ void PathPlannerBehavior::trigger_replan()
   waiting_for_map_check_replan_ = false;
   pose_at_plan_start_ = drone_pose_;
 
-  // Reset LiDAR safety state so the new FollowPath goal starts unbraked
-  lidar_braking_ = false;
-  consecutive_detections_ = 0;
-  last_sent_speed_ = 0.0;
-
   if (++replan_count_ > max_replans_) {
     RCLCPP_ERROR(
       this->get_logger(),
@@ -808,7 +673,6 @@ void PathPlannerBehavior::trigger_replan()
   if (!replanned_in_place) {
     send_follow_path_goal(original_goal_.navigation_speed);
   }
-  last_sent_speed_ = original_goal_.navigation_speed;
 }
 
 // ── FollowPath goal helper ─────────────────────────────────────────────────
@@ -863,160 +727,6 @@ bool PathPlannerBehavior::send_follow_path_modify(double max_speed)
   as2_msgs::action::FollowPath::Impl::SendGoalService::Response res;
   bool ok = follow_path_modify_client_->sendRequest(req, res, 1);
   return ok && res.accepted;
-}
-
-// ── LiDAR Reactive Safety Layer ───────────────────────────────────────────
-
-void PathPlannerBehavior::lidar_scan_cbk(const sensor_msgs::msg::LaserScan::SharedPtr msg)
-{
-  last_scan_ = msg;
-}
-
-bool PathPlannerBehavior::compute_travel_axis(geometry_msgs::msg::Vector3 & axis_out)
-{
-  if (path_.size() < 2) {
-    return false;
-  }
-
-  // Find the first waypoint still meaningfully ahead of the drone
-  constexpr double MIN_DIST = 0.15;
-  for (const auto & wp : path_) {
-    double dx = wp.x - drone_pose_.pose.position.x;
-    double dy = wp.y - drone_pose_.pose.position.y;
-    double d = std::hypot(dx, dy);
-    if (d > MIN_DIST) {
-      axis_out.x = dx / d;
-      axis_out.y = dy / d;
-      axis_out.z = 0.0;
-      return true;
-    }
-  }
-  return false;  // near goal — all waypoints already passed
-}
-
-int PathPlannerBehavior::count_corridor_hits(
-  const sensor_msgs::msg::LaserScan & scan,
-  const geometry_msgs::msg::Vector3 & axis,
-  double & nearest_along_out)
-{
-  geometry_msgs::msg::TransformStamped tf_earth_from_lidar;
-  try {
-    tf_earth_from_lidar = tf_buffer_->lookupTransform(
-      "earth", scan.header.frame_id,
-      rclcpp::Time(scan.header.stamp),
-      rclcpp::Duration::from_seconds(0.1));
-  } catch (const tf2::TransformException & ex) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 2000,
-      "[LIDAR_SAFETY] TF lookup failed: %s", ex.what());
-    consecutive_detections_ = 0;
-    return 0;
-  }
-
-  int hits = 0;
-  nearest_along_out = std::numeric_limits<double>::infinity();
-  float angle = scan.angle_min;
-
-  for (size_t i = 0; i < scan.ranges.size(); ++i, angle += scan.angle_increment) {
-    float r = scan.ranges[i];
-    if (!std::isfinite(r) || r < scan.range_min || r > static_cast<float>(lidar_danger_distance_)) {
-      continue;
-    }
-
-    geometry_msgs::msg::PointStamped pt_lidar;
-    pt_lidar.header = scan.header;
-    pt_lidar.point.x = r * std::cos(angle);
-    pt_lidar.point.y = r * std::sin(angle);
-    pt_lidar.point.z = 0.0;
-
-    geometry_msgs::msg::PointStamped pt_earth;
-    tf2::doTransform(pt_lidar, pt_earth, tf_earth_from_lidar);
-
-    double dx = pt_earth.point.x - drone_pose_.pose.position.x;
-    double dy = pt_earth.point.y - drone_pose_.pose.position.y;
-    double along = dx * axis.x + dy * axis.y;
-    double lat_x = dx - along * axis.x;
-    double lat_y = dy - along * axis.y;
-    double lateral = std::hypot(lat_x, lat_y);
-
-    if (along > 0.0 && along <= lidar_danger_distance_ && lateral <= lidar_corridor_half_width_) {
-      // Only count hits in free/unknown cells — skip known map obstacles (static walls)
-      // so the LiDAR layer only reacts to new/dynamic obstacles not yet confirmed in A*.
-      geometry_msgs::msg::PointStamped pt_check;
-      pt_check.header.frame_id = "earth";
-      pt_check.header.stamp = this->get_clock()->now();
-      pt_check.point = pt_earth.point;
-      if (path_planner_plugin_->is_occupied(pt_check)) {
-        continue;
-      }
-      hits++;
-      if (along < nearest_along_out) {
-        nearest_along_out = along;
-      }
-    }
-  }
-
-  return hits;
-}
-
-bool PathPlannerBehavior::evaluate_lidar_corridor(double & nearest_along)
-{
-  if (!last_scan_) {
-    return false;
-  }
-
-  geometry_msgs::msg::Vector3 axis;
-  if (!compute_travel_axis(axis)) {
-    return false;
-  }
-
-  double nearest = std::numeric_limits<double>::infinity();
-  int hits = count_corridor_hits(*last_scan_, axis, nearest);
-
-  if (hits >= lidar_min_cluster_size_) {
-    consecutive_detections_++;
-  } else {
-    consecutive_detections_ = 0;
-  }
-
-  if (consecutive_detections_ >= lidar_persistence_count_) {
-    nearest_along = nearest;
-    return true;
-  }
-  return false;
-}
-
-void PathPlannerBehavior::engage_lidar_brake()
-{
-  std_srvs::srv::Trigger::Request req;
-  std_srvs::srv::Trigger::Response res;
-  bool ok = follow_path_pause_client_->sendRequest(req, res, 2);
-  if (ok && res.success) {
-    RCLCPP_INFO(get_logger(), "[LIDAR_SAFETY] FollowPath paused (hover).");
-    lidar_braking_ = true;
-    lidar_brake_time_ = this->get_clock()->now();
-  } else {
-    // Fallback: cancel goal so map_check replan takes over
-    RCLCPP_WARN(
-      get_logger(),
-      "[LIDAR_SAFETY] Pause service failed — falling back to cancel+await replan.");
-    follow_path_client_->async_cancel_all_goals();
-    waiting_for_map_check_replan_ = true;
-    lidar_braking_ = true;
-    lidar_brake_time_ = this->get_clock()->now();
-  }
-}
-
-double PathPlannerBehavior::compute_safe_speed(double d) const
-{
-  double nav_speed = static_cast<double>(original_goal_.navigation_speed);
-  double range = lidar_danger_distance_ - lidar_stop_distance_;
-  if (range <= 0.0) {
-    return 0.0;
-  }
-  double ratio = (d - lidar_stop_distance_) / range;
-  double v = lidar_kp_ * ratio * nav_speed;
-  return std::clamp(v, 0.0, nav_speed);
 }
 
 #include "rclcpp_components/register_node_macro.hpp"

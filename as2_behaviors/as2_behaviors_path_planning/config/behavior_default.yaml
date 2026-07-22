@@ -9,15 +9,3 @@
     same_goal_tolerance: 0.05 # XY tolerance [m] to consider two goals equivalent
     max_replans: 15  # Maximum number of reactive replans before aborting navigation
     map_check_period: 0.5  # Seconds between checks for a direct path to the goal [s]
-
-    # LiDAR Reactive Safety Layer
-    enable_lidar_safety: true        # Enable raw-LiDAR based stop/decel layer
-    lidar_check_period: 0.05         # Timer period for corridor evaluation [s] (20 Hz)
-    lidar_danger_distance: 3.0       # Corridor depth that triggers deceleration [m]
-    lidar_stop_distance: 0.7         # Distance at which full stop is engaged [m]
-    lidar_corridor_half_width: 0.5   # Half-width of the frontal corridor [m]
-    lidar_min_cluster_size: 3        # Min rays per scan to count as a cluster (spatial noise rejection)
-    lidar_persistence_count: 2       # Consecutive confirmations needed before reacting (temporal noise rejection)
-    enable_lidar_decel: true         # Enable progressive speed reduction before full stop
-    lidar_kp: 1.0                    # Proportional gain for speed ramp (1.0 = linear from danger to stop)
-    decel_speed_epsilon: 0.1         # Min speed change [m/s] before resending FollowPath goal (hysteresis)
