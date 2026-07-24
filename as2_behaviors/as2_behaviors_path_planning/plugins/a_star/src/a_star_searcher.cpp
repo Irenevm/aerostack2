@@ -40,6 +40,17 @@ nav_msgs::msg::OccupancyGrid AStarSearcher::update_grid(
   const nav_msgs::msg::OccupancyGrid & occ_grid, const Point2i & drone_pose,
   double safety_distance, int drone_mask_factor)
 {
+  // NOTA (estudio de latencia, 2026-07-23): se probó unknown_as_free=true
+  // (tratar celdas -1 sin explorar como libres) para evitar el "Path to
+  // goal not found" espurio nada más despegar, que activa is_intermediate_goal_
+  // sin obstáculo real y deja ciega la detección dinámica (segment-check y
+  // full-block requieren !is_intermediate_goal_ en on_run(),
+  // path_planner_behavior.cpp). Confirmado que reduce ese bug, PERO destapa
+  // un bucle de replanificación cerca de obstáculos reales (A* oscila entre
+  // rutas ligeramente distintas por zonas no exploradas, sin converger,
+  // replanificando casi cada tick) que en un caso llevó a colisión — un
+  // fallo potencialmente peor que el original. Revertido a false (default)
+  // hasta poder arreglar la inestabilidad de replan sin introducirla.
   cv::Mat mat = gridToImg(occ_grid);
 
   cv::Point2i origin = cellToPixel(drone_pose, occ_grid.info);

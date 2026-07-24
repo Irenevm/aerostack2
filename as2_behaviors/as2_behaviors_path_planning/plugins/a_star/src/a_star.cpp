@@ -37,6 +37,7 @@
 
 #include <deque>
 #include <limits>
+#include <tuple>
 
 namespace a_star
 {
@@ -123,6 +124,42 @@ bool Plugin::on_activate(
 
   std::vector<Point2i> path = a_star_searcher_.solve_graph(drone_cell, goal_cell);
   if (path.size() == 0) {
+    // Diagnóstico [LAT]: volcar el estado REAL (mapa crudo, antes de
+    // erosión/mask) alrededor del dron y del goal para saber si el fallo
+    // es por celdas realmente ocupadas (detección espuria cerca del propio
+    // dron, p.ej. bamboleo de despegue) o por otra causa — con
+    // unknown_as_free=true las celdas -1 ya no deberían bloquear, así que
+    // si esto muestra "occ" alto cerca del dron, la causa es distinta a
+    // las celdas desconocidas.
+    auto scan_box = [this](Point2i center, int radius_cells) {
+      int free_n = 0, occ_n = 0, unknown_n = 0;
+      const auto & info = last_occ_grid_.info;
+      for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
+        for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
+          int cx = center.x + dx;
+          int cy = center.y + dy;
+          if (cx < 0 || cy < 0 || cx >= static_cast<int>(info.width) ||
+            cy >= static_cast<int>(info.height))
+          {
+            continue;
+          }
+          int idx = cy * info.width + cx;
+          if (idx < 0 || idx >= static_cast<int>(last_occ_grid_.data.size())) {continue;}
+          int8_t v = last_occ_grid_.data[idx];
+          if (v == -1) {unknown_n++;} else if (v > 30) {occ_n++;} else {free_n++;}
+        }
+      }
+      return std::make_tuple(free_n, occ_n, unknown_n);
+    };
+    auto [drone_free, drone_occ, drone_unk] = scan_box(drone_cell, 10);  // ±1m
+    auto [goal_free, goal_occ, goal_unk] = scan_box(goal_cell, 10);
+    RCLCPP_ERROR(
+      node_ptr_->get_logger(),
+      "[LAT] ASTAR_FAIL t=%.6f drone_cell=[%d,%d] box1m(free=%d,occ=%d,unk=%d) "
+      "goal_cell=[%d,%d] box1m(free=%d,occ=%d,unk=%d) drone_z=%.3f",
+      node_ptr_->get_clock()->now().seconds(), drone_cell.x, drone_cell.y,
+      drone_free, drone_occ, drone_unk, goal_cell.x, goal_cell.y,
+      goal_free, goal_occ, goal_unk, drone_pose.pose.position.z);
     RCLCPP_ERROR(node_ptr_->get_logger(), "Path to goal not found. Goal Rejected.");
     return false;
   }

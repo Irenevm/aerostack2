@@ -298,12 +298,13 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
     check_map_ = false;
     // Run A* to update the internal graph with the current map, and check
     // whether the original goal is directly reachable from here.
+    bool can_reach_goal = path_planner_plugin_->on_activate(drone_pose_, original_goal_);
     RCLCPP_INFO(
       this->get_logger(),
-      "[MAP_CHECK] tick — drone=[%.2f, %.2f] intermediate=%s",
+      "[MAP_CHECK] tick — drone=[%.2f, %.2f] intermediate=%s can_reach_goal=%s",
       drone_pose_.pose.position.x, drone_pose_.pose.position.y,
-      is_intermediate_goal_ ? "true" : "false");
-    bool can_reach_goal = path_planner_plugin_->on_activate(drone_pose_, original_goal_);
+      is_intermediate_goal_ ? "true" : "false",
+      can_reach_goal ? "true" : "false");
 
     // Hito A: direct path to original goal became available while flying to frontier.
     // Only fire when drone is sufficiently close to original goal — A* spuriously finds
@@ -318,6 +319,10 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
         "[MAP_CHECK] Direct path to goal [%.2f, %.2f] now available (dist=%.1fm). Replanning.",
         original_goal_.point.point.x, original_goal_.point.point.y, dist_to_original_goal);
       is_intermediate_goal_ = false;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "[LAT] FRONTIER_EXIT t=%.6f — obstacle detection re-enabled",
+        this->get_clock()->now().seconds());
       // Replan in place via trigger_replan() -> modify(): no cancel, the drone
       // keeps flying its current segment until the new path takes effect.
       waiting_for_map_check_replan_ = true;
@@ -330,11 +335,18 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
         original_goal_.point.point.x, original_goal_.point.point.y);
       waiting_for_map_check_replan_ = true;
       need_replan_ = true;
-    } else if (can_reach_goal && !is_intermediate_goal_ && !waiting_for_map_check_replan_) {
-      // Hito B (path segment check): we're on the direct path — sample every segment
-      // between consecutive waypoints to detect obstacles that fall between RDP-reduced
-      // waypoints. Sampling at safety_distance_ intervals catches dynamic obstacles that
-      // appear between waypoints but would not be caught by checking waypoints alone.
+    }
+
+    // Hito B (path segment check): sample every segment of the *currently active*
+    // path_ — frontier leg or direct-to-goal leg, whichever we're flying — to
+    // detect obstacles that fall between RDP-reduced waypoints. This runs
+    // regardless of is_intermediate_goal_: a frontier path was computed with
+    // unknown_as_free=false too, so it never crosses unexplored cells, only
+    // known-free ones — is_occupied() here can only flag a genuinely new
+    // obstacle, not stale "unknown" cells. Gating this on !is_intermediate_goal_
+    // (as before) left the drone architecturally blind to new obstacles for the
+    // entire duration of a frontier leg (see [LAT] FRONTIER_ENTER/EXIT bug).
+    if (!need_replan_ && !waiting_for_map_check_replan_) {
       double dist_from_plan_start = std::hypot(
         drone_pose_.pose.position.x - pose_at_plan_start_.pose.position.x,
         drone_pose_.pose.position.y - pose_at_plan_start_.pose.position.y);
@@ -375,6 +387,10 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
                 this->get_logger(),
                 "[MAP_CHECK] Path segment occupied at [%.2f, %.2f] (segment %zu/%zu). Replanning.",
                 sx, sy, i + 1, path_.size() - 1);
+              RCLCPP_WARN(
+                this->get_logger(),
+                "[LAT] DETECT t=%.6f pos=[%.2f,%.2f]",
+                this->get_clock()->now().seconds(), sx, sy);
               waiting_for_map_check_replan_ = true;
               need_replan_ = true;
               occupied_found = true;
@@ -510,8 +526,14 @@ void PathPlannerBehavior::trigger_replan()
     this->get_logger(), "Replanning to original goal [%.2f, %.2f, %.2f]",
     original_goal_.point.point.x, original_goal_.point.point.y,
     original_goal_.point.point.z);
+  double lat_t_replan_start = this->get_clock()->now().seconds();
+  RCLCPP_INFO(this->get_logger(), "[LAT] REPLAN_START t=%.6f", lat_t_replan_start);
 
   bool ret = path_planner_plugin_->on_activate(drone_pose_, original_goal_);
+  RCLCPP_INFO(
+    this->get_logger(), "[LAT] ASTAR_DONE t=%.6f dt=%.6f",
+    this->get_clock()->now().seconds(),
+    this->get_clock()->now().seconds() - lat_t_replan_start);
   if (!ret) {
     bool occupied = path_planner_plugin_->is_occupied(original_goal_.point);
     if (occupied) {
@@ -595,6 +617,11 @@ void PathPlannerBehavior::trigger_replan()
       ret = path_planner_plugin_->on_activate(drone_pose_, frontier_goal);
       if (ret) {
         is_intermediate_goal_ = true;
+        RCLCPP_WARN(
+          this->get_logger(),
+          "[LAT] FRONTIER_ENTER t=%.6f — full-block check disabled until Hito A "
+          "fires or frontier reached; segment-check stays active on the frontier leg",
+          this->get_clock()->now().seconds());
       }
     }
   }
@@ -662,6 +689,10 @@ void PathPlannerBehavior::trigger_replan()
   bool replanned_in_place = false;
   if (follow_path_active_) {
     replanned_in_place = send_follow_path_modify(original_goal_.navigation_speed);
+    RCLCPP_INFO(
+      this->get_logger(), "[LAT] MODIFY_%s t=%.6f",
+      replanned_in_place ? "ACCEPTED" : "REJECTED",
+      this->get_clock()->now().seconds());
     if (!replanned_in_place) {
       RCLCPP_WARN(
         this->get_logger(),
@@ -672,6 +703,9 @@ void PathPlannerBehavior::trigger_replan()
   }
   if (!replanned_in_place) {
     send_follow_path_goal(original_goal_.navigation_speed);
+    RCLCPP_INFO(
+      this->get_logger(), "[LAT] GOAL_SENT t=%.6f",
+      this->get_clock()->now().seconds());
   }
 }
 
