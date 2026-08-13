@@ -76,6 +76,54 @@ PathPlannerBehavior::PathPlannerBehavior(const rclcpp::NodeOptions & options)
   this->declare_parameter("max_replans", 15);
   max_replans_ = this->get_parameter("max_replans").as_int();
 
+  // Frontier-arrival settle retry, see .hpp for full rationale.
+  this->declare_parameter("frontier_stuck_settle_s", frontier_stuck_settle_s_);
+  frontier_stuck_settle_s_ = this->get_parameter("frontier_stuck_settle_s").as_double();
+  this->declare_parameter("frontier_stuck_max_retries", frontier_stuck_max_retries_);
+  frontier_stuck_max_retries_ = this->get_parameter("frontier_stuck_max_retries").as_int();
+
+  // Physics-based reactive braking corridor, see .hpp for full rationale.
+  this->declare_parameter("corridor_half_angle_deg", corridor_half_angle_deg_);
+  corridor_half_angle_deg_ = this->get_parameter("corridor_half_angle_deg").as_double();
+  this->declare_parameter("corridor_half_width", corridor_half_width_);
+  corridor_half_width_ = this->get_parameter("corridor_half_width").as_double();
+  this->declare_parameter("corridor_k_brake_s", corridor_k_brake_s_);
+  corridor_k_brake_s_ = this->get_parameter("corridor_k_brake_s").as_double();
+  this->declare_parameter("corridor_l_detect_s", corridor_l_detect_s_);
+  corridor_l_detect_s_ = this->get_parameter("corridor_l_detect_s").as_double();
+  this->declare_parameter("corridor_margin_m", corridor_margin_m_);
+  corridor_margin_m_ = this->get_parameter("corridor_margin_m").as_double();
+  this->declare_parameter("corridor_stop_distance", corridor_stop_distance_);
+  corridor_stop_distance_ = this->get_parameter("corridor_stop_distance").as_double();
+  this->declare_parameter("corridor_floor_speed", corridor_floor_speed_);
+  corridor_floor_speed_ = this->get_parameter("corridor_floor_speed").as_double();
+  this->declare_parameter("corridor_min_cluster", corridor_min_cluster_);
+  corridor_min_cluster_ = this->get_parameter("corridor_min_cluster").as_int();
+  this->declare_parameter("corridor_persistence", corridor_persistence_);
+  corridor_persistence_ = this->get_parameter("corridor_persistence").as_int();
+  this->declare_parameter("corridor_speed_epsilon", corridor_speed_epsilon_);
+  corridor_speed_epsilon_ = this->get_parameter("corridor_speed_epsilon").as_double();
+  this->declare_parameter("corridor_post_replan_grace_s", corridor_post_replan_grace_s_);
+  corridor_post_replan_grace_s_ =
+    this->get_parameter("corridor_post_replan_grace_s").as_double();
+  this->declare_parameter("corridor_min_brake_hold_s", corridor_min_brake_hold_s_);
+  corridor_min_brake_hold_s_ = this->get_parameter("corridor_min_brake_hold_s").as_double();
+  this->declare_parameter("corridor_min_modify_interval_s", corridor_min_modify_interval_s_);
+  corridor_min_modify_interval_s_ =
+    this->get_parameter("corridor_min_modify_interval_s").as_double();
+
+  this->declare_parameter("corridor_check_period", 0.05);
+  double corridor_check_period = this->get_parameter("corridor_check_period").as_double();
+  corridor_check_timer_ = this->create_wall_timer(
+    std::chrono::duration<double>(corridor_check_period),
+    [this]() { check_corridor_ = true; });
+  corridor_check_timer_->cancel();
+
+  lidar_scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+    "sensor_measurements/lidar/scan",
+    rclcpp::SensorDataQoS(),
+    std::bind(&PathPlannerBehavior::lidar_scan_cbk, this, std::placeholders::_1));
+
   this->declare_parameter("map_check_period", 2.0);
   double map_check_period = this->get_parameter("map_check_period").as_double();
   map_check_timer_ = this->create_wall_timer(
@@ -137,11 +185,23 @@ bool PathPlannerBehavior::on_activate(
   is_intermediate_goal_ = false;
   need_replan_ = false;
   replan_count_ = 0;
+  frontier_retry_pending_ = false;
+  frontier_stuck_retries_ = 0;
   check_map_ = false;
   waiting_for_map_check_replan_ = false;
   follow_path_active_ = false;
   pose_at_plan_start_ = drone_pose_;
   map_check_timer_->reset();
+
+  check_corridor_ = false;
+  corridor_confirm_count_ = 0;
+  corridor_braking_ = false;
+  last_corridor_speed_sent_ = -1.0;
+  corridor_grace_until_ = this->get_clock()->now();
+  corridor_nearest_at_replan_ = std::numeric_limits<double>::infinity();
+  corridor_last_modify_time_ =
+    this->get_clock()->now() - rclcpp::Duration::from_seconds(corridor_min_modify_interval_s_);
+  corridor_check_timer_->reset();
 
   bool ret = path_planner_plugin_->on_activate(drone_pose_, *goal);
   if (!ret) {
@@ -215,6 +275,8 @@ bool PathPlannerBehavior::on_deactivate(const std::shared_ptr<std::string> & mes
 {
   RCLCPP_INFO(this->get_logger(), "Received request to cancel goal");
   map_check_timer_->cancel();
+  corridor_check_timer_->cancel();
+  check_corridor_ = false;
   waiting_for_map_check_replan_ = false;
   // Cancel only the goal started from navigation. Behaviors only accepts
   // one goal simultaneously, don't have to worry about
@@ -272,6 +334,13 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
     return as2_behavior::ExecutionStatus::FAILURE;
   }
 
+  // Frontier-arrival settle retry: waiting for M_g to consolidate before
+  // trying trigger_replan() again, see .hpp for full rationale.
+  if (frontier_retry_pending_ && this->get_clock()->now() >= frontier_retry_deadline_) {
+    frontier_retry_pending_ = false;
+    need_replan_ = true;
+  }
+
   // FollowPath server rejected the goal (busy after a cancel). Retry by
   // replanning: the server will be free by the next on_run cycle.
   if (follow_path_rejected_) {
@@ -292,6 +361,24 @@ as2_behavior::ExecutionStatus PathPlannerBehavior::on_run(
     need_replan_ = false;
     trigger_replan();
     return as2_behavior::ExecutionStatus::RUNNING;
+  }
+
+  // Physics-based reactive braking corridor: runs every tick regardless of
+  // MAP_CHECK state, so it can react to an obstacle at any point in the
+  // flight, not just right after a replan. See .hpp for full rationale.
+  if (check_corridor_) {
+    check_corridor_ = false;
+    if (follow_path_active_ && !need_replan_ && !waiting_for_map_check_replan_) {
+      // The grace window itself is no longer checked here — it's evaluated
+      // inside check_reactive_corridor(), which only lets it suppress a new
+      // brake decision when nothing has gotten worse since the replan (see
+      // corridor_nearest_at_replan_ in the .hpp for why: a blanket time-based
+      // block here left the corridor blind to a genuinely new, unrelated
+      // obstacle for the full grace duration, confirmed 2026-07-29 both live
+      // and in batteries — the obstacle was already within ~1.0-1.2m by the
+      // time MAP_CHECK's own slower detection caught it).
+      check_reactive_corridor();
+    }
   }
 
   if (check_map_) {
@@ -589,18 +676,36 @@ void PathPlannerBehavior::trigger_replan()
         return;
       }
 
-      // Abort if the frontier is too close to the drone — the drone is already
-      // at the nearest reachable cell and keeps replanning to the same spot.
+      // The frontier being this close to the drone usually does NOT mean a
+      // genuine dead end — it usually means M_g (the consolidated occupancy
+      // map A* reads) hasn't caught up yet with what the LiDAR already saw
+      // while approaching (measured lag: 0.15-8s, median ~1.7s, in the
+      // Dmin(v) latency study). Retry a bounded number of times, waiting
+      // between attempts, before concluding it's a genuine dead end.
       double dist_drone_to_frontier = std::hypot(
         drone_pose_.pose.position.x - new_frontier.point.x,
         drone_pose_.pose.position.y - new_frontier.point.y);
       constexpr double MIN_FRONTIER_DIST = 0.5;
       if (dist_drone_to_frontier < MIN_FRONTIER_DIST) {
+        if (frontier_stuck_retries_ < frontier_stuck_max_retries_) {
+          frontier_stuck_retries_++;
+          RCLCPP_WARN(
+            this->get_logger(),
+            "Replan: frontier [%.2f, %.2f] is only %.3fm away — map may not have "
+            "consolidated yet. Retrying in %.1fs (%d/%d).",
+            new_frontier.point.x, new_frontier.point.y, dist_drone_to_frontier,
+            frontier_stuck_settle_s_, frontier_stuck_retries_, frontier_stuck_max_retries_);
+          frontier_retry_pending_ = true;
+          frontier_retry_deadline_ =
+            this->get_clock()->now() + rclcpp::Duration::from_seconds(frontier_stuck_settle_s_);
+          return;
+        }
         RCLCPP_ERROR(
           this->get_logger(),
-          "Replan: frontier [%.2f, %.2f] is only %.3fm away — drone is stuck at "
-          "the closest reachable cell. Aborting navigation.",
-          new_frontier.point.x, new_frontier.point.y, dist_drone_to_frontier);
+          "Replan: frontier [%.2f, %.2f] is still only %.3fm away after %d retries — "
+          "drone is genuinely stuck at the closest reachable cell. Aborting navigation.",
+          new_frontier.point.x, new_frontier.point.y, dist_drone_to_frontier,
+          frontier_stuck_retries_);
         if (follow_path_active_) {
           follow_path_client_->async_cancel_all_goals();
           follow_path_active_ = false;
@@ -608,6 +713,7 @@ void PathPlannerBehavior::trigger_replan()
         navigation_aborted_ = true;
         return;
       }
+      frontier_stuck_retries_ = 0;
 
       as2_msgs::action::NavigateToPoint::Goal frontier_goal;
       frontier_goal.point            = new_frontier;
@@ -686,9 +792,21 @@ void PathPlannerBehavior::trigger_replan()
   // cancel+send when there's no running goal to modify (first activation,
   // previous goal was rejected, or it already finished) or the plugin
   // rejects the modify outright.
+  // If the corridor is already braking, a replan (MAP_CHECK/frontier) only
+  // changes WHERE the drone is going — it says nothing about whether the
+  // obstacle the corridor is braking for is still there. Keep the reduced
+  // speed instead of silently resuming cruise speed underneath the corridor;
+  // this was previously a priority-inversion bug (confirmed both in plain
+  // "recto" and in frontier mode, 2026-07-29): a MAP_CHECK replan firing a
+  // few tens of ms after REACTIVE_DECEL would cancel the corridor's braking
+  // and resend the path at full cruise speed, right as the drone was
+  // closest to the obstacle.
+  double replan_speed = corridor_braking_ ?
+    last_corridor_speed_sent_ : original_goal_.navigation_speed;
+
   bool replanned_in_place = false;
   if (follow_path_active_) {
-    replanned_in_place = send_follow_path_modify(original_goal_.navigation_speed);
+    replanned_in_place = send_follow_path_modify(replan_speed);
     RCLCPP_INFO(
       this->get_logger(), "[LAT] MODIFY_%s t=%.6f",
       replanned_in_place ? "ACCEPTED" : "REJECTED",
@@ -702,10 +820,199 @@ void PathPlannerBehavior::trigger_replan()
     }
   }
   if (!replanned_in_place) {
-    send_follow_path_goal(original_goal_.navigation_speed);
+    send_follow_path_goal(replan_speed);
     RCLCPP_INFO(
       this->get_logger(), "[LAT] GOAL_SENT t=%.6f",
       this->get_clock()->now().seconds());
+  }
+
+  // Trust the just-computed path for a grace period — see .hpp for why:
+  // A* only guarantees safety_distance_ of clearance on a tight detour,
+  // which can be closer than this corridor's own danger_distance would
+  // otherwise re-trigger on. But only re-arm the grace period / clear the
+  // braking state when the corridor wasn't already actively braking — if it
+  // was, leave it running and let its own release logic (omni_nearest +
+  // corridor_min_brake_hold_s) decide when the obstacle is actually clear.
+  if (!corridor_braking_) {
+    corridor_grace_until_ =
+      this->get_clock()->now() + rclcpp::Duration::from_seconds(corridor_post_replan_grace_s_);
+    // Baseline for the grace override (2026-07-29): capture what the
+    // corridor sees right now, so a later reading that's genuinely worse
+    // (or newly detects something when nothing was visible here) can still
+    // break through the grace window instead of being blindly suppressed.
+    corridor_nearest_at_replan_ = std::numeric_limits<double>::infinity();
+    evaluate_lidar_corridor(corridor_nearest_at_replan_);
+  }
+  corridor_confirm_count_ = 0;
+}
+
+// ── Physics-based reactive braking corridor ─────────────────────────────────
+
+void PathPlannerBehavior::lidar_scan_cbk(const sensor_msgs::msg::LaserScan::SharedPtr msg)
+{
+  last_scan_ = msg;
+}
+
+bool PathPlannerBehavior::evaluate_lidar_corridor(double & nearest_range)
+{
+  if (!last_scan_ || last_scan_->ranges.empty()) {
+    return false;
+  }
+
+  // Forward direction: angle 0 in the scan message IS the drone's forward
+  // direction (matches telemetry_logger.py's validated convention — the
+  // scan frame is body-fixed under PATH_FACING). Deriving this instead from
+  // tf2::getYaw(drone orientation) was tried in an earlier attempt (see
+  // archive/reactive-corridor-attempt) and proved too noisy tick-to-tick to
+  // use.
+  const double target_angle_body = 0.0;
+
+  double danger_distance = std::numeric_limits<double>::infinity();
+  {
+    double v = static_cast<double>(original_goal_.navigation_speed);
+    danger_distance = v * (corridor_k_brake_s_ + corridor_l_detect_s_) + corridor_margin_m_;
+  }
+  // Generous upper bound for how far out we even bother scanning — kept
+  // under the ~3.0-4.8m ground-ring LiDAR artifact documented in the
+  // 2026-07-24 latency study (lowest vertical ring hitting the ground).
+  double max_check_range = std::min(danger_distance + 0.5, 2.6);
+
+  double half_angle_rad = corridor_half_angle_deg_ * M_PI / 180.0;
+  int n = static_cast<int>(last_scan_->ranges.size());
+  int contiguous = 0;
+  int best_contiguous = 0;
+  double best_min_range = std::numeric_limits<double>::infinity();
+  double running_min = std::numeric_limits<double>::infinity();
+
+  for (int i = 0; i < n; ++i) {
+    double angle = last_scan_->angle_min + i * last_scan_->angle_increment;
+    double delta = angle - target_angle_body;
+    while (delta > M_PI) {delta -= 2 * M_PI;}
+    while (delta < -M_PI) {delta += 2 * M_PI;}
+
+    float r = last_scan_->ranges[i];
+    bool qualifies = false;
+    if (std::isfinite(r) && r >= last_scan_->range_min && r <= last_scan_->range_max &&
+      r <= max_check_range && std::fabs(delta) <= half_angle_rad)
+    {
+      double lateral = r * std::sin(delta);
+      if (std::fabs(lateral) <= corridor_half_width_) {
+        qualifies = true;
+      }
+    }
+
+    if (qualifies) {
+      contiguous++;
+      running_min = std::min(running_min, static_cast<double>(r));
+      if (contiguous > best_contiguous) {
+        best_contiguous = contiguous;
+        best_min_range = running_min;
+      }
+    } else {
+      contiguous = 0;
+      running_min = std::numeric_limits<double>::infinity();
+    }
+  }
+
+  if (best_contiguous >= corridor_min_cluster_) {
+    nearest_range = best_min_range;
+    return true;
+  }
+  return false;
+}
+
+double PathPlannerBehavior::nearest_omnidirectional_range(double max_range)
+{
+  if (!last_scan_) {return std::numeric_limits<double>::infinity();}
+  double best = std::numeric_limits<double>::infinity();
+  for (float r : last_scan_->ranges) {
+    if (std::isfinite(r) && r >= last_scan_->range_min && r <= max_range) {
+      best = std::min(best, static_cast<double>(r));
+    }
+  }
+  return best;
+}
+
+void PathPlannerBehavior::check_reactive_corridor()
+{
+  double cruise_speed = static_cast<double>(original_goal_.navigation_speed);
+  double danger_distance =
+    cruise_speed * (corridor_k_brake_s_ + corridor_l_detect_s_) + corridor_margin_m_;
+
+  double nearest = std::numeric_limits<double>::infinity();
+  bool obstacle = evaluate_lidar_corridor(nearest);
+
+  RCLCPP_INFO_THROTTLE(
+    this->get_logger(), *this->get_clock(), 2000,
+    "[LAT] CORRIDOR_DEBUG t=%.6f obstacle=%s nearest=%.2f danger=%.2f",
+    this->get_clock()->now().seconds(), obstacle ? "true" : "false", nearest, danger_distance);
+
+  if (obstacle && nearest < danger_distance) {
+    // Grace override (2026-07-29): if we're still inside the post-replan
+    // grace window AND not already braking, only let this through when the
+    // situation is genuinely worse than it was when the replan fired —
+    // otherwise a replan that had nothing to do with this obstacle (e.g. a
+    // far-away segment fix or a frontier hop) would blind the corridor to
+    // it for the full grace duration. "Worse" = closer than the baseline
+    // captured at replan time (which is +inf if nothing was visible then,
+    // so a brand-new detection always passes).
+    if (!corridor_braking_ && this->get_clock()->now() < corridor_grace_until_ &&
+      nearest >= corridor_nearest_at_replan_)
+    {
+      corridor_confirm_count_ = 0;
+      return;
+    }
+    corridor_confirm_count_++;
+    if (corridor_confirm_count_ < corridor_persistence_) {
+      return;
+    }
+    // Binary decision, not a continuous proportional ramp: "can I stop in
+    // time? no -> brake; yes -> don't touch anything" (this is the actual
+    // physics question danger_distance answers). A continuous ramp needs
+    // many modify() calls as distance shrinks (~15 in one flight, observed
+    // 2026-07-27) — and *every* modify() call makes FollowPath's
+    // position-mode plugin re-anchor from a fresh short path near the
+    // drone, which visibly jerks it backward before continuing forward
+    // (the same artifact trigger_replan()'s DEAD_ZONE trim exists for).
+    // Many of those jerks in a row compounded into multi-metre oscillation.
+    // Sending the floor speed exactly once when entering the brake state
+    // (and cruise speed exactly once on release, below) keeps modify()
+    // calls rare enough that this artifact stays a one-off, not a pattern.
+    if (!corridor_braking_) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "[LAT] REACTIVE_DECEL t=%.6f d=%.2fm v=%.2f->%.2f",
+        this->get_clock()->now().seconds(), nearest, cruise_speed, corridor_floor_speed_);
+      send_follow_path_modify_from_here(corridor_floor_speed_);
+      last_corridor_speed_sent_ = corridor_floor_speed_;
+      corridor_last_modify_time_ = this->get_clock()->now();
+      corridor_braking_since_ = this->get_clock()->now();
+    }
+    corridor_braking_ = true;
+  } else {
+    corridor_confirm_count_ = 0;
+    // Release condition is deliberately omnidirectional (not the narrow
+    // forward corridor): a replan can change the target waypoint direction
+    // within one tick, instantly making the same, still-close obstacle
+    // read as "outside the corridor" before the drone has actually moved.
+    // Also requires a minimum hold time to avoid chattering on readings
+    // that hover right at the threshold.
+    if (corridor_braking_) {
+      double time_braking = (this->get_clock()->now() - corridor_braking_since_).seconds();
+      double omni_nearest = nearest_omnidirectional_range(corridor_stop_distance_ * 2.5);
+      if (time_braking >= corridor_min_brake_hold_s_ &&
+        omni_nearest > corridor_stop_distance_ * 2.2)
+      {
+        RCLCPP_INFO(
+          this->get_logger(),
+          "[LAT] REACTIVE_CLEAR t=%.6f omni_nearest=%.2f held=%.2fs — restoring %.2f",
+          this->get_clock()->now().seconds(), omni_nearest, time_braking, cruise_speed);
+        send_follow_path_modify_from_here(cruise_speed);
+        last_corridor_speed_sent_ = cruise_speed;
+        corridor_last_modify_time_ = this->get_clock()->now();
+        corridor_braking_ = false;
+      }
+    }
   }
 }
 
@@ -749,6 +1056,112 @@ bool PathPlannerBehavior::send_follow_path_modify(double max_speed)
   goal_msg.max_speed = static_cast<float>(max_speed);
   int i = 0;
   for (auto & p : path_) {
+    as2_msgs::msg::PoseWithID pid;
+    pid.id = std::to_string(i++);
+    pid.pose.position = p;
+    pid.pose.position.z = original_goal_.point.point.z;
+    goal_msg.path.push_back(pid);
+  }
+
+  as2_msgs::action::FollowPath::Impl::SendGoalService::Request req;
+  req.goal = goal_msg;
+  as2_msgs::action::FollowPath::Impl::SendGoalService::Response res;
+  bool ok = follow_path_modify_client_->sendRequest(req, res, 1);
+  return ok && res.accepted;
+}
+
+// Same as send_follow_path_modify(), but rebuilds the waypoint list from the
+// drone's CURRENT position instead of reusing path_ as-is. path_[0] is the
+// drone's position at the *last actual replan* (see trigger_replan()) — for
+// a single modify() right after a replan that's still fresh, but the
+// reactive corridor below calls this repeatedly, seconds apart, as it
+// ramps speed up and down. Resending path_ unchanged each time means
+// resending that now-stale waypoint[0], and FollowPath's position-mode
+// plugin restarts tracking from it — observed directly as the drone
+// visibly reversing back towards where it was several seconds earlier,
+// every single time the corridor changed speed (2026-07-27).
+bool PathPlannerBehavior::send_follow_path_modify_from_here(double max_speed)
+{
+  if (path_.size() < 2) {
+    return send_follow_path_modify(max_speed);
+  }
+  // Distance-only trimming (as trigger_replan()'s own DEAD_ZONE does) is not
+  // enough here: it only drops a *leading* waypoint if it happens to be
+  // within 0.4m of the drone, and stops at the first one that isn't. If the
+  // drone has travelled further than that since the last real replan
+  // (easily 2-3m during the 2.5s post-replan grace at cruise speed) several
+  // waypoints can already be behind it without ever being that close, and
+  // none of them get dropped — sent as-is, FollowPath routes the drone
+  // backward through all of them before it resumes forward progress
+  // (observed directly in RViz as "a lot of waypoints behind the intended
+  // trajectory", 2026-07-27). Instead, find which *segment* of path_ the
+  // drone is currently nearest to (same approach used for the corridor's
+  // own forward-direction lookup) and keep only that segment's far
+  // endpoint onward — independent of how far the drone has travelled.
+  std::vector<geometry_msgs::msg::Point> corrected;
+  {
+    size_t best_i = 0;
+    double best_seg_dist = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i + 1 < path_.size(); ++i) {
+      const auto & p1 = path_[i];
+      const auto & p2 = path_[i + 1];
+      double dx = p2.x - p1.x, dy = p2.y - p1.y;
+      double seg_len2 = dx * dx + dy * dy;
+      double t = seg_len2 > 1e-9 ?
+        ((drone_pose_.pose.position.x - p1.x) * dx +
+        (drone_pose_.pose.position.y - p1.y) * dy) / seg_len2 : 0.0;
+      t = std::clamp(t, 0.0, 1.0);
+      double px = p1.x + t * dx, py = p1.y + t * dy;
+      double d = std::hypot(
+        px - drone_pose_.pose.position.x, py - drone_pose_.pose.position.y);
+      if (d < best_seg_dist) {
+        best_seg_dist = d;
+        best_i = i;
+      }
+    }
+    corrected.assign(path_.begin() + best_i + 1, path_.end());
+  }
+  constexpr double DEAD_ZONE = 0.4;
+  while (corrected.size() > 1) {
+    const auto & wp = corrected.front();
+    double dx = wp.x - drone_pose_.pose.position.x;
+    double dy = wp.y - drone_pose_.pose.position.y;
+    if (std::sqrt(dx * dx + dy * dy) < DEAD_ZONE) {
+      corrected.erase(corrected.begin());
+    } else {
+      break;
+    }
+  }
+  corrected.insert(corrected.begin(), drone_pose_.pose.position);
+
+  // ── DIAGNOSTIC BLOCK (2026-07-29) ───────────────────────────────────────
+  // Same format as trigger_replan()'s DIAG block, but for corridor-driven
+  // modify() calls specifically — the previous DIAG block never fired here,
+  // so a stale/behind waypoint sent by the corridor's own speed changes was
+  // invisible in the logs.
+  RCLCPP_INFO(
+    this->get_logger(),
+    "[DIAG corridor_modify] Drone pos : [%.3f, %.3f, %.3f] | max_speed=%.2f",
+    drone_pose_.pose.position.x, drone_pose_.pose.position.y,
+    drone_pose_.pose.position.z, max_speed);
+  for (size_t k = 0; k < corrected.size(); ++k) {
+    const auto & wp = corrected[k];
+    double dx = wp.x - drone_pose_.pose.position.x;
+    double dy = wp.y - drone_pose_.pose.position.y;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "[DIAG corridor_modify] Waypoint[%zu/%zu] : [%.3f, %.3f] | delta_drone->[%.3f, %.3f]",
+      k, corrected.size() - 1, wp.x, wp.y, dx, dy);
+  }
+  // ── END DIAGNOSTIC ──────────────────────────────────────────────────────
+
+  auto goal_msg = as2_msgs::action::FollowPath::Goal();
+  goal_msg.header.frame_id = "earth";
+  goal_msg.header.stamp = this->get_clock()->now();
+  goal_msg.yaw = original_goal_.yaw;
+  goal_msg.max_speed = static_cast<float>(max_speed);
+  int i = 0;
+  for (auto & p : corrected) {
     as2_msgs::msg::PoseWithID pid;
     pid.id = std::to_string(i++);
     pid.pose.position = p;
