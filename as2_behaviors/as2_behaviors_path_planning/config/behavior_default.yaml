@@ -1,9 +1,8 @@
 /**:
   ros__parameters:
-    node_frequency: 200.0  # Sugerido por el tutor (2026-07-29) — por defecto -1 (sin límite fijo)
-    run_frequency: 100.0   # Por defecto 10 Hz (behavior_server__impl.hpp) — la lógica reactiva
-                            # (corredor, MAP_CHECK, reintento frontier) solo se procesa en on_run(),
-                            # así que a 10 Hz añadía hasta 0.1s de retraso extra a cada reacción
+    node_frequency: 200.0   # Node's internal update rate [Hz]
+    run_frequency: 100.0    # Behavior's on_run() call rate [Hz] — the reactive logic
+                             # (corridor, MAP_CHECK, frontier retry) only runs here
     enable_visualization: false  # Enable visualization topics
     enable_path_optimizer: false  # Enable path smoother
     safety_distance: 0.5  # Distance to obstacle [m]
@@ -14,82 +13,34 @@
     max_replans: 15  # Maximum number of reactive replans before aborting navigation
     map_check_period: 0.5  # Seconds between checks for a direct path to the goal [s]
 
-    # Frontier-arrival settle retry (2026-07-28). Missions to a goal outside the
-    # already-mapped area are the normal case, not an edge case — they always
-    # go through a "reach frontier -> replan to real goal" step. Right after
-    # arrival, M_g (the consolidated map A* reads) can still lag what the
-    # LiDAR already saw, wrongly looking like a dead end. Retry instead of
-    # aborting immediately; only give up after frontier_stuck_max_retries.
+    # Frontier-arrival settle retry: waits and retries instead of aborting
+    # immediately when a just-reached frontier looks like a dead end (the
+    # map can lag briefly behind what the sensor already saw).
     frontier_stuck_settle_s: 1.8       # [s] wait between retries
-    frontier_stuck_max_retries: 6      # bounded: ~10.8s cumulative wait budget
+    frontier_stuck_max_retries: 6      # max retries before giving up
 
-    # Physics-based reactive braking corridor (2026-07-27). Targets the
-    # "sufficient physical margin but software delay causes collision" case
-    # from the 2026-07-24 Dmin(v) latency study, not the physically-impossible
-    # zone (left as a documented limitation). danger_distance(v) =
-    # v*(corridor_k_brake_s + corridor_l_detect_s) + corridor_margin_m.
-    corridor_check_period: 0.05      # Timer period for corridor evaluation [s] (20 Hz)
-    corridor_half_angle_deg: 25.0    # Half-angle of the frontal corridor [deg]
+    # Physics-based reactive braking corridor: reads a LaserScan directly
+    # (independent of MAP_CHECK) and brakes when danger_distance(v) =
+    # v*(corridor_k_brake_s + corridor_l_detect_s) + corridor_margin_m is
+    # closer than what's ahead. See doc/Agosto/ for full design rationale.
+    corridor_scan_topic: "sensor_measurements/lidar/scan"  # LaserScan topic to read — any
+                                        # sensor whose data is converted to LaserScan works
+                                        # here (e.g. a depth camera via pointcloud_to_laserscan),
+                                        # with no code changes
+    corridor_check_period: 0.05      # Timer period for corridor evaluation [s]
+    corridor_half_angle_deg: 25.0    # Half-angle of the frontal detection corridor [deg]
     corridor_half_width: 0.6         # Lateral half-width of the corridor [m]
-    corridor_k_brake_s: 1.0          # [s] measured stopping-distance/speed ratio (conservative
-                                      # upper bound from mission_brake_test.py, 2026-07-27:
-                                      # d_stop(v) scales linearly with v, NOT v^2 — the
-                                      # controller's settling time is roughly constant across
-                                      # speeds, not its deceleration)
-    corridor_l_detect_s: 0.25        # [s] assumed latency of this layer's own fast raw-LiDAR
-                                      # check — raised from 0.15: first live test (2026-07-27)
-                                      # showed the corridor's actual first trigger lagging the
-                                      # theoretical threshold by ~0.08s (LiDAR scan latency +
-                                      # message transport not accounted for in the first guess)
-    corridor_margin_m: 0.4           # [m] fixed extra safety margin — raised from 0.2: same
-                                      # first test landed two repetitions at 0.98m/1.00m, right
-                                      # on the collision threshold, too tight a margin
-    # corridor_stop_distance kept BELOW safety_distance (0.5m, A*'s own
-    # routing clearance) — a tight A*-computed detour only guarantees
-    # safety_distance of clearance, so a larger stop_distance here would
-    # always conflict with a legitimately-safe detour (freeze-loop failure
-    # mode, see archive/reactive-corridor-attempt git branch).
-    corridor_stop_distance: 0.4      # [m] speed floor kicks in below this
-    corridor_floor_speed: 0.4        # [m/s] never fully stops — avoids the pause/resume
-                                      # deadlock family of bugs entirely
+    corridor_k_brake_s: 1.0          # [s] measured stopping-distance/speed ratio
+    corridor_l_detect_s: 0.25        # [s] this layer's own detection latency
+    corridor_margin_m: 0.4           # [m] fixed extra safety margin
+    corridor_stop_distance: 0.4      # [m] speed floor kicks in below this — kept below
+                                      # safety_distance so it doesn't fight a safe A* detour
+    corridor_floor_speed: 0.4        # [m/s] never fully stops
     corridor_min_cluster: 3          # Min contiguous rays to count as a detection
     corridor_persistence: 1          # Consecutive confirmations before reacting
     corridor_speed_epsilon: 0.1      # Min speed delta before resending modify() [m/s]
-    corridor_post_replan_grace_s: 2.5  # Suspend corridor for this long after any replan —
-                                        # trust the detour A* just computed. Tried lowering to
-                                        # 0.6s (2026-07-29) to reduce the blind window against new
-                                        # obstacles unrelated to the just-computed replan — did not
-                                        # reduce collisions (2/6 both ways) and introduced a new
-                                        # CRASH outcome (likely the pre-existing controller
-                                        # instability bug, triggered more often by the resulting
-                                        # increase in modify() frequency). Reverted pending a more
-                                        # thorough investigation — see doc/Agosto/.
+    corridor_post_replan_grace_s: 2.5  # Suspend corridor for this long after any replan,
+                                        # unless something has gotten closer since (trust
+                                        # the detour A* just computed otherwise)
     corridor_min_brake_hold_s: 1.0     # Min time before release is even considered (anti-chatter)
-    corridor_min_modify_interval_s: 0.4  # Min gap between corridor modify() calls — throttles
-                                          # churn that can trigger a pre-existing controller
-                                          # instability bug (documented in project history)
-
-    # Sensor source for the corridor (2026-08-14) — demonstrates the design
-    # isn't LiDAR-specific. "lidar" (default) reads sensor_measurements/lidar/scan
-    # (LaserScan, body-forward angle/range). "pointcloud" reads a depth
-    # camera's raw PointCloud2 instead (optical frame: x=right, y=down,
-    # z=forward) — same danger_distance formula, same decision logic, only
-    # the "is anything ahead" reading changes source. See doc/Agosto/.
-    corridor_sensor_source: "lidar"    # "lidar" | "pointcloud" — default sigue siendo LiDAR
-                                        # (validado); pointcloud es opt-in, ver doc/Agosto/
-    corridor_cloud_topic: "sensor_measurements/camera/points"
-    corridor_scan_topic: "sensor_measurements/camera/scan"  # TEMPORAL, prueba: activo: LiDAR (nativo). Para
-                                        # probar la cámara SIN código propio, apuntar aquí a
-                                        # un topic LaserScan generado por pointcloud_to_laserscan
-                                        # a partir de la cámara (ver doc/Agosto/, sección 16) y
-                                        # dejar corridor_sensor_source en "lidar" (sí, "lidar" —
-                                        # el nombre del parámetro es histórico, en realidad solo
-                                        # significa "leer de un topic LaserScan")
-    corridor_height_half_band_m: 0.5   # [m] vertical half-band for the pointcloud source
-    corridor_cloud_min_range_m: 0.8    # [m] reject near-field clutter (own airframe) — see
-                                        # rationale in the .hpp, found via a false brake at 0.62m
-                                        # (reproduced twice) while still stationary at spawn
-    corridor_cloud_startup_grace_s: 3.0  # [s] ignore pointcloud right after activation — the
-                                          # false-positive distance itself varies (0.62m, 0.80m),
-                                          # so a distance cutoff alone isn't reliable; what's
-                                          # consistent is WHEN it happens (takeoff transition)
+    corridor_min_modify_interval_s: 0.4  # Min gap between corridor modify() calls

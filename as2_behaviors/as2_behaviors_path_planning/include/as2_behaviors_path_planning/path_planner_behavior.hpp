@@ -56,7 +56,6 @@
 #include "as2_msgs/action/follow_path.hpp"
 #include "as2_behaviors_path_planning/path_planner_plugin_base.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
-#include "sensor_msgs/msg/point_cloud2.hpp"
 
 class PathPlannerBehavior
   : public as2_behavior::BehaviorServer<as2_msgs::action::NavigateToPoint>
@@ -98,20 +97,15 @@ private:
   int replan_count_ = 0;
   int max_replans_ = 15;
 
-  // Frontier-arrival settle retry: the occupancy map (M_g) lags the raw
-  // LiDAR by 0.15-8s (median ~1.7s, measured in the Dmin(v) latency study).
-  // Right after reaching a frontier, closest_free_point() can still return
-  // the same edge cell the drone is standing on, because the area it just
-  // scanned hasn't been consolidated into M_g yet — not because it's
-  // actually a dead end. Retry a bounded number of times, waiting between
-  // attempts, before concluding it's a genuine dead end and aborting.
+  // Frontier-arrival settle retry: the occupancy map can lag the sensor
+  // briefly, so a spot that just got scanned may look like a dead end for a
+  // moment even though it isn't. Retry a bounded number of times before
+  // concluding it's a genuine dead end and aborting.
   bool frontier_retry_pending_ = false;
   rclcpp::Time frontier_retry_deadline_;
   int frontier_stuck_retries_ = 0;
-  double frontier_stuck_settle_s_ = 1.8;   // [s] wait between retries — a hair above the
-                                            // median M_g consolidation latency
-  int frontier_stuck_max_retries_ = 6;     // bounded: ~10.8s cumulative wait budget before
-                                            // giving up on this frontier for good
+  double frontier_stuck_settle_s_ = 1.8;   // [s] wait between retries
+  int frontier_stuck_max_retries_ = 6;     // max retries before giving up
 
   // Periodic map-check: detect when direct path to goal becomes available
   rclcpp::TimerBase::SharedPtr map_check_timer_;
@@ -122,129 +116,60 @@ private:
   bool waiting_for_map_check_replan_ = false;
 
   // ── Physics-based reactive braking corridor ─────────────────────────────
-  // Targets specifically the 2026-07-24 latency study's "sufficient physical
-  // margin but software delay causes collision" case (roughly half of
-  // Dmin(v) at every speed tested is detection/replan latency, not braking
-  // physics — see doc). Deliberately does NOT try to help below Dmin(v),
-  // that part is a real physical limit documented as such.
+  // Reads a LaserScan directly (independent of MAP_CHECK/the map) and
+  // brakes when danger_distance(v) = v*(k_brake + l_detect) + margin is
+  // closer than the nearest obstacle ahead. Only helps when there's real
+  // physical margin to react in time but software would otherwise be too
+  // slow — it doesn't try to help below the physical stopping distance.
   //
-  // Runs continuously on the raw LaserScan, independent of MAP_CHECK, so it
-  // can react to an obstacle appearing at any point in the flight. Danger
-  // distance is computed from *measured* stopping physics
-  // (mission_brake_test.py, 2026-07-27: distance-to-stop scales linearly
-  // with speed, d_stop(v) ≈ k_brake * v, NOT the v^2 a constant-deceleration
-  // model would predict — the controller's settling time is roughly
-  // constant across speeds, not its deceleration) plus the latency of this
-  // layer's own fast detection, instead of a hand-tuned constant.
+  // Design notes:
+  //   - stop_distance kept below safety_distance_ (A*'s own routing
+  //     clearance), so this layer doesn't re-brake against a detour A*
+  //     already computed as safe.
+  //   - never fully stops (floor speed > 0), so the drone always keeps
+  //     making progress.
+  //   - forward direction = LaserScan angle 0 (matches the sensor's
+  //     body-fixed frame under PATH_FACING).
+  //   - release condition is omnidirectional with a minimum hold time, to
+  //     avoid chattering when a replan changes heading mid-brake.
+  //   - modify() calls are rate-limited to avoid triggering a separate
+  //     controller instability issue from rapid speed-change churn.
   //
-  // Design choices carried over from an earlier, now-archived attempt (see
-  // git branch archive/reactive-corridor-attempt) that are still correct:
-  //   - stop_distance kept BELOW safety_distance_ (A*'s own routing
-  //     clearance) — otherwise this layer re-brakes against detours A*
-  //     already computed as safe (freeze-loop failure mode).
-  //   - never fully stop (floor speed > 0) — guarantees
-  //     dist_from_plan_start always grows, so any situation resolves
-  //     itself without extra "unstick" logic.
-  //   - forward direction = LaserScan angle 0 directly (matches
-  //     telemetry_logger.py's validated convention); do NOT derive it from
-  //     tf2::getYaw(drone orientation), which was too noisy tick-to-tick.
-  //   - release/clear condition is omnidirectional (not the narrow forward
-  //     corridor) with a minimum hold time, to avoid chattering when a
-  //     replan changes heading mid-brake.
-  //   - rate-limit modify() calls — a pre-existing, never-fixed controller
-  //     instability bug (documented in project history) is triggered more
-  //     often by rapid replan/speed-change churn.
+  // corridor_scan_topic_ is not hardcoded to the LiDAR: any sensor whose
+  // data has been converted to LaserScan works here with no code changes
+  // (e.g. a depth camera via a pointcloud_to_laserscan instance).
+  std::string corridor_scan_topic_ = "sensor_measurements/lidar/scan";
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr lidar_scan_sub_;
   sensor_msgs::msg::LaserScan::SharedPtr last_scan_;
   rclcpp::TimerBase::SharedPtr corridor_check_timer_;
   bool check_corridor_ = false;
 
-  // Alternative sensor source (2026-08-14): the corridor's decision logic
-  // below (check_reactive_corridor) only needs a `nearest_range` reading —
-  // it doesn't care which sensor produced it. This lets the corridor run
-  // off a depth camera's raw point cloud instead of the LiDAR's LaserScan,
-  // to demonstrate the design isn't LiDAR-specific (tutor request). Camera
-  // clouds arrive in the sensor's OPTICAL frame (REP-103: x=right, y=down,
-  // z=forward/depth) — NOT the same convention as the LaserScan's angle-0
-  // forward — so evaluate_cloud_corridor() filters on (z, x, y) instead of
-  // (range, angle).
-  std::string corridor_sensor_source_ = "lidar";  // "lidar" | "pointcloud"
-  std::string corridor_cloud_topic_ = "sensor_measurements/camera/points";
-  // Topic for the "lidar" source's LaserScan (2026-08-14: parameterized so
-  // it can point at any LaserScan producer, e.g. a pointcloud_to_laserscan
-  // instance converting the camera's cloud — no corridor code changes
-  // needed for that path, only this topic name).
-  std::string corridor_scan_topic_ = "sensor_measurements/lidar/scan";
-  double corridor_height_half_band_m_ = 0.5;  // [m] vertical half-band (sensor-frame z)
-  // Minimum accepted forward distance for the point cloud source (2026-08-14
-  // finding): points closer than this are rejected as near-field clutter
-  // (the drone's own airframe/legs) rather than a real obstacle. Reproduced
-  // identically in two separate live flights: a brake triggered by
-  // something at exactly 0.62m, always right at the takeoff->forward-flight
-  // transition, while the drone was still stationary at spawn (~5m from the
-  // real obstacle) — 0.3m wasn't enough to reject it, raised to clear that
-  // artifact with margin. The LiDAR doesn't need this: it's already
-  // restricted to a body-mounted 3D band that avoids seeing the drone's own
-  // frame.
-  double corridor_cloud_min_range_m_ = 0.8;   // [m]
-  // The min-range cutoff above wasn't enough on its own — the false-positive
-  // distance itself varies flight to flight (0.62m, then 0.80m), so it isn't
-  // a fixed geometric offset to filter out by distance alone. What IS
-  // consistent is WHEN it happens: always right at the takeoff -> forward
-  // -flight transition (attitude/vibration settling right after NAV_START).
-  // Mirrors the existing CRASH_STARTUP_GRACE_S pattern in the mission
-  // script — same idea, applied here to corridor detections instead of
-  // crash detection. Armed in on_activate(); only affects the pointcloud
-  // source, the LiDAR has shown no equivalent artifact.
-  double corridor_cloud_startup_grace_s_ = 3.0;  // [s]
-  rclcpp::Time corridor_cloud_grace_until_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr corridor_cloud_sub_;
-  sensor_msgs::msg::PointCloud2::SharedPtr last_cloud_;
-
   double corridor_half_angle_deg_ = 25.0;   // half-angle of the frontal corridor [deg]
   double corridor_half_width_ = 0.6;        // lateral half-width of the corridor [m]
-  // danger_distance(v) = v*(k_brake + l_detect) + margin — see rationale above.
   double corridor_k_brake_s_ = 1.0;         // [s] measured stopping-distance/speed ratio
-                                             // (conservative upper bound, mission_brake_test.py)
-  double corridor_l_detect_s_ = 0.15;       // [s] assumed latency of this layer's own fast
-                                             // raw-LiDAR check (corridor_check_period plus a
-                                             // couple of confirmations)
+  double corridor_l_detect_s_ = 0.15;       // [s] this layer's own detection latency
   double corridor_margin_m_ = 0.2;          // [m] fixed extra safety margin
-  double corridor_stop_distance_ = 0.4;     // [m] speed floor kicks in below this — kept
-                                             // under safety_distance_ (0.5m), see rationale
+  double corridor_stop_distance_ = 0.4;     // [m] speed floor kicks in below this
   double corridor_floor_speed_ = 0.4;       // [m/s] never fully stops
   int corridor_min_cluster_ = 3;            // min contiguous rays to count as a detection
   int corridor_persistence_ = 1;            // consecutive confirmations before reacting
   double corridor_speed_epsilon_ = 0.1;     // min speed delta before resending modify() [m/s]
-  double corridor_post_replan_grace_s_ = 2.5;
-  double corridor_min_brake_hold_s_ = 1.0;
-  double corridor_min_modify_interval_s_ = 0.4;
+  double corridor_post_replan_grace_s_ = 2.5;  // [s] suspend corridor after a replan
+  double corridor_min_brake_hold_s_ = 1.0;     // [s] min time before considering release
+  double corridor_min_modify_interval_s_ = 0.4;  // [s] min gap between modify() calls
   rclcpp::Time corridor_grace_until_;
   rclcpp::Time corridor_last_modify_time_;
   rclcpp::Time corridor_braking_since_;
   int corridor_confirm_count_ = 0;
-  // Baseline reading captured at the moment the grace window was armed
-  // (2026-07-29 fix). The grace period exists to trust a detour A* just
-  // computed for something the corridor might also be seeing — it should
-  // NOT blind the corridor to a genuinely new threat that had nothing to do
-  // with that replan (e.g. a frontier hop over a far, unrelated segment).
-  // Only suppress a new brake decision during grace if the current reading
-  // isn't meaningfully worse than this baseline; if something has gotten
-  // closer since the replan (or is newly visible when nothing was before),
-  // react anyway regardless of the grace window.
+  // Snapshot of the nearest reading when the grace window was armed, so a
+  // replan's grace period only suppresses braking if nothing has gotten
+  // closer since — a genuinely new threat still gets through.
   double corridor_nearest_at_replan_ = std::numeric_limits<double>::infinity();
   bool corridor_braking_ = false;
   double last_corridor_speed_sent_ = -1.0;
 
   void lidar_scan_cbk(const sensor_msgs::msg::LaserScan::SharedPtr msg);
-  void cloud_cbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
   bool evaluate_lidar_corridor(double & nearest_range);
-  bool evaluate_cloud_corridor(double & nearest_range);
-  // Dispatches to whichever of the two above matches corridor_sensor_source_.
-  // Every corridor call site goes through this instead of picking a sensor
-  // function directly, so the decision logic (thresholds, braking, grace
-  // window) never has to know which sensor is active.
-  bool evaluate_active_corridor(double & nearest_range);
   double nearest_omnidirectional_range(double max_range);
   void check_reactive_corridor();
 
