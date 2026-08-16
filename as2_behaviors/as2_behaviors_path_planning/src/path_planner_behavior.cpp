@@ -250,6 +250,9 @@ bool PathPlannerBehavior::on_activate(
 
   // Call FollowPath behavior
   follow_path_succeeded_ = false;
+  follow_path_feedback_.reset();
+  follow_path_rejected_ = false;
+  navigation_aborted_ = false;
   if (!this->follow_path_client_->wait_for_action_server(
       std::chrono::seconds(5)))
   {
