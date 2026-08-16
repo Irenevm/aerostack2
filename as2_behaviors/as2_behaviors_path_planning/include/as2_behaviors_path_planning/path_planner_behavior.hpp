@@ -56,6 +56,7 @@
 #include "as2_msgs/action/follow_path.hpp"
 #include "as2_behaviors_path_planning/path_planner_plugin_base.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
 
 class PathPlannerBehavior
   : public as2_behavior::BehaviorServer<as2_msgs::action::NavigateToPoint>
@@ -158,6 +159,48 @@ private:
   rclcpp::TimerBase::SharedPtr corridor_check_timer_;
   bool check_corridor_ = false;
 
+  // Alternative sensor source (2026-08-14): the corridor's decision logic
+  // below (check_reactive_corridor) only needs a `nearest_range` reading —
+  // it doesn't care which sensor produced it. This lets the corridor run
+  // off a depth camera's raw point cloud instead of the LiDAR's LaserScan,
+  // to demonstrate the design isn't LiDAR-specific (tutor request). Camera
+  // clouds arrive in the sensor's OPTICAL frame (REP-103: x=right, y=down,
+  // z=forward/depth) — NOT the same convention as the LaserScan's angle-0
+  // forward — so evaluate_cloud_corridor() filters on (z, x, y) instead of
+  // (range, angle).
+  std::string corridor_sensor_source_ = "lidar";  // "lidar" | "pointcloud"
+  std::string corridor_cloud_topic_ = "sensor_measurements/camera/points";
+  // Topic for the "lidar" source's LaserScan (2026-08-14: parameterized so
+  // it can point at any LaserScan producer, e.g. a pointcloud_to_laserscan
+  // instance converting the camera's cloud — no corridor code changes
+  // needed for that path, only this topic name).
+  std::string corridor_scan_topic_ = "sensor_measurements/lidar/scan";
+  double corridor_height_half_band_m_ = 0.5;  // [m] vertical half-band (sensor-frame z)
+  // Minimum accepted forward distance for the point cloud source (2026-08-14
+  // finding): points closer than this are rejected as near-field clutter
+  // (the drone's own airframe/legs) rather than a real obstacle. Reproduced
+  // identically in two separate live flights: a brake triggered by
+  // something at exactly 0.62m, always right at the takeoff->forward-flight
+  // transition, while the drone was still stationary at spawn (~5m from the
+  // real obstacle) — 0.3m wasn't enough to reject it, raised to clear that
+  // artifact with margin. The LiDAR doesn't need this: it's already
+  // restricted to a body-mounted 3D band that avoids seeing the drone's own
+  // frame.
+  double corridor_cloud_min_range_m_ = 0.8;   // [m]
+  // The min-range cutoff above wasn't enough on its own — the false-positive
+  // distance itself varies flight to flight (0.62m, then 0.80m), so it isn't
+  // a fixed geometric offset to filter out by distance alone. What IS
+  // consistent is WHEN it happens: always right at the takeoff -> forward
+  // -flight transition (attitude/vibration settling right after NAV_START).
+  // Mirrors the existing CRASH_STARTUP_GRACE_S pattern in the mission
+  // script — same idea, applied here to corridor detections instead of
+  // crash detection. Armed in on_activate(); only affects the pointcloud
+  // source, the LiDAR has shown no equivalent artifact.
+  double corridor_cloud_startup_grace_s_ = 3.0;  // [s]
+  rclcpp::Time corridor_cloud_grace_until_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr corridor_cloud_sub_;
+  sensor_msgs::msg::PointCloud2::SharedPtr last_cloud_;
+
   double corridor_half_angle_deg_ = 25.0;   // half-angle of the frontal corridor [deg]
   double corridor_half_width_ = 0.6;        // lateral half-width of the corridor [m]
   // danger_distance(v) = v*(k_brake + l_detect) + margin — see rationale above.
@@ -194,7 +237,14 @@ private:
   double last_corridor_speed_sent_ = -1.0;
 
   void lidar_scan_cbk(const sensor_msgs::msg::LaserScan::SharedPtr msg);
+  void cloud_cbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
   bool evaluate_lidar_corridor(double & nearest_range);
+  bool evaluate_cloud_corridor(double & nearest_range);
+  // Dispatches to whichever of the two above matches corridor_sensor_source_.
+  // Every corridor call site goes through this instead of picking a sensor
+  // function directly, so the decision logic (thresholds, braking, grace
+  // window) never has to know which sensor is active.
+  bool evaluate_active_corridor(double & nearest_range);
   double nearest_omnidirectional_range(double max_range);
   void check_reactive_corridor();
 

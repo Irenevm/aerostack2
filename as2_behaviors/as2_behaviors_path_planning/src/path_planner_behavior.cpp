@@ -40,6 +40,7 @@
 #include "as2_behaviors_path_planning/path_planner_behavior.hpp"
 #include "as2_core/names/actions.hpp"
 #include "as2_core/names/topics.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
 
 PathPlannerBehavior::PathPlannerBehavior(const rclcpp::NodeOptions & options)
 : as2_behavior::BehaviorServer<as2_msgs::action::NavigateToPoint>("path_planner", options)
@@ -112,6 +113,22 @@ PathPlannerBehavior::PathPlannerBehavior(const rclcpp::NodeOptions & options)
   corridor_min_modify_interval_s_ =
     this->get_parameter("corridor_min_modify_interval_s").as_double();
 
+  this->declare_parameter("corridor_sensor_source", corridor_sensor_source_);
+  corridor_sensor_source_ = this->get_parameter("corridor_sensor_source").as_string();
+  this->declare_parameter("corridor_cloud_topic", corridor_cloud_topic_);
+  corridor_cloud_topic_ = this->get_parameter("corridor_cloud_topic").as_string();
+  this->declare_parameter("corridor_scan_topic", corridor_scan_topic_);
+  corridor_scan_topic_ = this->get_parameter("corridor_scan_topic").as_string();
+  this->declare_parameter("corridor_height_half_band_m", corridor_height_half_band_m_);
+  corridor_height_half_band_m_ =
+    this->get_parameter("corridor_height_half_band_m").as_double();
+  this->declare_parameter("corridor_cloud_min_range_m", corridor_cloud_min_range_m_);
+  corridor_cloud_min_range_m_ =
+    this->get_parameter("corridor_cloud_min_range_m").as_double();
+  this->declare_parameter("corridor_cloud_startup_grace_s", corridor_cloud_startup_grace_s_);
+  corridor_cloud_startup_grace_s_ =
+    this->get_parameter("corridor_cloud_startup_grace_s").as_double();
+
   this->declare_parameter("corridor_check_period", 0.05);
   double corridor_check_period = this->get_parameter("corridor_check_period").as_double();
   corridor_check_timer_ = this->create_wall_timer(
@@ -119,10 +136,21 @@ PathPlannerBehavior::PathPlannerBehavior(const rclcpp::NodeOptions & options)
     [this]() { check_corridor_ = true; });
   corridor_check_timer_->cancel();
 
-  lidar_scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-    "sensor_measurements/lidar/scan",
-    rclcpp::SensorDataQoS(),
-    std::bind(&PathPlannerBehavior::lidar_scan_cbk, this, std::placeholders::_1));
+  // Only subscribe to the sensor actually in use (corridor_sensor_source_)
+  // — avoids an idle subscription (and its own DDS traffic) for whichever
+  // one isn't active.
+  if (corridor_sensor_source_ != "pointcloud") {
+    lidar_scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
+      corridor_scan_topic_,
+      rclcpp::SensorDataQoS(),
+      std::bind(&PathPlannerBehavior::lidar_scan_cbk, this, std::placeholders::_1));
+  }
+  if (corridor_sensor_source_ == "pointcloud") {
+    corridor_cloud_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+      corridor_cloud_topic_,
+      rclcpp::SensorDataQoS(),
+      std::bind(&PathPlannerBehavior::cloud_cbk, this, std::placeholders::_1));
+  }
 
   this->declare_parameter("map_check_period", 2.0);
   double map_check_period = this->get_parameter("map_check_period").as_double();
@@ -201,6 +229,8 @@ bool PathPlannerBehavior::on_activate(
   corridor_nearest_at_replan_ = std::numeric_limits<double>::infinity();
   corridor_last_modify_time_ =
     this->get_clock()->now() - rclcpp::Duration::from_seconds(corridor_min_modify_interval_s_);
+  corridor_cloud_grace_until_ =
+    this->get_clock()->now() + rclcpp::Duration::from_seconds(corridor_cloud_startup_grace_s_);
   corridor_check_timer_->reset();
 
   bool ret = path_planner_plugin_->on_activate(drone_pose_, *goal);
@@ -841,7 +871,7 @@ void PathPlannerBehavior::trigger_replan()
     // (or newly detects something when nothing was visible here) can still
     // break through the grace window instead of being blindly suppressed.
     corridor_nearest_at_replan_ = std::numeric_limits<double>::infinity();
-    evaluate_lidar_corridor(corridor_nearest_at_replan_);
+    evaluate_active_corridor(corridor_nearest_at_replan_);
   }
   corridor_confirm_count_ = 0;
 }
@@ -851,6 +881,11 @@ void PathPlannerBehavior::trigger_replan()
 void PathPlannerBehavior::lidar_scan_cbk(const sensor_msgs::msg::LaserScan::SharedPtr msg)
 {
   last_scan_ = msg;
+}
+
+void PathPlannerBehavior::cloud_cbk(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+{
+  last_cloud_ = msg;
 }
 
 bool PathPlannerBehavior::evaluate_lidar_corridor(double & nearest_range)
@@ -921,8 +956,112 @@ bool PathPlannerBehavior::evaluate_lidar_corridor(double & nearest_range)
   return false;
 }
 
+bool PathPlannerBehavior::evaluate_cloud_corridor(double & nearest_range)
+{
+  // Same danger_distance / max_check_range logic as evaluate_lidar_corridor
+  // (kept identical on purpose — this function only changes WHERE the
+  // "is anything within max_check_range, ahead of us" reading comes from,
+  // not the physics-based threshold itself).
+  //
+  // Frame convention VERIFIED empirically (2026-08-14) against the real
+  // topic, not assumed from the message's frame_id: despite frame_id being
+  // named ".../optical_frame", the published PointCloud2 data is NOT in the
+  // REP-103 optical convention (x=right,y=down,z=forward). Live samples
+  // showed x always positive and growing with distance from the drone
+  // (0.6-9.8m), y spanning wide either side (-5.7 to 5.7m), z small and
+  // near zero (-0.3 to 1.9m) — i.e. x=forward/depth, y=lateral, z=vertical,
+  // the plain "sensor" REP-103 convention, same axis roles as the drone
+  // body frame. An initial version of this function assumed the optical
+  // convention from the frame name alone and never found a single
+  // qualifying point in a live test — always double-check field values
+  // against a live `ros2 topic echo`, don't trust the frame_id string.
+  if (!last_cloud_ || last_cloud_->data.empty()) {
+    return false;
+  }
+  // Startup grace (2026-08-14): ignore the point cloud entirely for the
+  // first corridor_cloud_startup_grace_s_ after activation — see rationale
+  // by the member declaration in the .hpp.
+  if (this->get_clock()->now() < corridor_cloud_grace_until_) {
+    return false;
+  }
+
+  double danger_distance = std::numeric_limits<double>::infinity();
+  {
+    double v = static_cast<double>(original_goal_.navigation_speed);
+    danger_distance = v * (corridor_k_brake_s_ + corridor_l_detect_s_) + corridor_margin_m_;
+  }
+  double max_check_range = std::min(danger_distance + 0.5, 2.6);
+
+  sensor_msgs::PointCloud2ConstIterator<float> it_x(*last_cloud_, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> it_y(*last_cloud_, "y");
+  sensor_msgs::PointCloud2ConstIterator<float> it_z(*last_cloud_, "z");
+
+  int qualifying_count = 0;
+  double nearest_forward = std::numeric_limits<double>::infinity();
+
+  for (; it_x != it_x.end(); ++it_x, ++it_y, ++it_z) {
+    float x = *it_x;  // forward / depth
+    float y = *it_y;  // lateral (left+)
+    float z = *it_z;  // vertical (up+)
+
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      continue;  // Gazebo reports +inf for "no return", unlike LaserScan's range_max
+    }
+    if (x <= static_cast<float>(corridor_cloud_min_range_m_) || x > max_check_range) {
+      continue;
+    }
+    if (std::fabs(y) > corridor_half_width_ || std::fabs(z) > corridor_height_half_band_m_) {
+      continue;
+    }
+
+    qualifying_count++;
+    nearest_forward = std::min(nearest_forward, static_cast<double>(x));
+  }
+
+  // No natural "contiguous ray" concept on an unordered cloud — reuse
+  // corridor_min_cluster_ as a minimum qualifying-point count instead, same
+  // role (reject a single noisy point) via a different mechanism.
+  if (qualifying_count >= corridor_min_cluster_) {
+    nearest_range = nearest_forward;
+    return true;
+  }
+  return false;
+}
+
+bool PathPlannerBehavior::evaluate_active_corridor(double & nearest_range)
+{
+  if (corridor_sensor_source_ == "pointcloud") {
+    return evaluate_cloud_corridor(nearest_range);
+  }
+  return evaluate_lidar_corridor(nearest_range);
+}
+
 double PathPlannerBehavior::nearest_omnidirectional_range(double max_range)
 {
+  // Used for the REACTIVE_CLEAR release check. With the LiDAR this is a
+  // true 360° reading (whole ranges[] array, no angle filter). A single
+  // forward-facing depth camera has no rear/side coverage at all, so
+  // "omnidirectional" here really means "everywhere the camera's FOV can
+  // see" — a known, narrower safety margin than the LiDAR case. Worth
+  // flagging explicitly, not silently pretending it's equivalent.
+  if (corridor_sensor_source_ == "pointcloud") {
+    if (!last_cloud_ || last_cloud_->data.empty()) {return std::numeric_limits<double>::infinity();}
+    sensor_msgs::PointCloud2ConstIterator<float> it_x(*last_cloud_, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> it_y(*last_cloud_, "y");
+    sensor_msgs::PointCloud2ConstIterator<float> it_z(*last_cloud_, "z");
+    double best = std::numeric_limits<double>::infinity();
+    for (; it_x != it_x.end(); ++it_x, ++it_y, ++it_z) {
+      float x = *it_x;
+      float y = *it_y;
+      float z = *it_z;
+      if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {continue;}
+      double d = std::sqrt(
+        static_cast<double>(x) * x + static_cast<double>(y) * y + static_cast<double>(z) * z);
+      if (d <= max_range) {best = std::min(best, d);}
+    }
+    return best;
+  }
+
   if (!last_scan_) {return std::numeric_limits<double>::infinity();}
   double best = std::numeric_limits<double>::infinity();
   for (float r : last_scan_->ranges) {
@@ -940,7 +1079,7 @@ void PathPlannerBehavior::check_reactive_corridor()
     cruise_speed * (corridor_k_brake_s_ + corridor_l_detect_s_) + corridor_margin_m_;
 
   double nearest = std::numeric_limits<double>::infinity();
-  bool obstacle = evaluate_lidar_corridor(nearest);
+  bool obstacle = evaluate_active_corridor(nearest);
 
   RCLCPP_INFO_THROTTLE(
     this->get_logger(), *this->get_clock(), 2000,

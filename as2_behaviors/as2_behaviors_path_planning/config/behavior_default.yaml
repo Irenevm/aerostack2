@@ -68,3 +68,28 @@
     corridor_min_modify_interval_s: 0.4  # Min gap between corridor modify() calls — throttles
                                           # churn that can trigger a pre-existing controller
                                           # instability bug (documented in project history)
+
+    # Sensor source for the corridor (2026-08-14) — demonstrates the design
+    # isn't LiDAR-specific. "lidar" (default) reads sensor_measurements/lidar/scan
+    # (LaserScan, body-forward angle/range). "pointcloud" reads a depth
+    # camera's raw PointCloud2 instead (optical frame: x=right, y=down,
+    # z=forward) — same danger_distance formula, same decision logic, only
+    # the "is anything ahead" reading changes source. See doc/Agosto/.
+    corridor_sensor_source: "lidar"    # "lidar" | "pointcloud" — default sigue siendo LiDAR
+                                        # (validado); pointcloud es opt-in, ver doc/Agosto/
+    corridor_cloud_topic: "sensor_measurements/camera/points"
+    corridor_scan_topic: "sensor_measurements/camera/scan"  # TEMPORAL, prueba: activo: LiDAR (nativo). Para
+                                        # probar la cámara SIN código propio, apuntar aquí a
+                                        # un topic LaserScan generado por pointcloud_to_laserscan
+                                        # a partir de la cámara (ver doc/Agosto/, sección 16) y
+                                        # dejar corridor_sensor_source en "lidar" (sí, "lidar" —
+                                        # el nombre del parámetro es histórico, en realidad solo
+                                        # significa "leer de un topic LaserScan")
+    corridor_height_half_band_m: 0.5   # [m] vertical half-band for the pointcloud source
+    corridor_cloud_min_range_m: 0.8    # [m] reject near-field clutter (own airframe) — see
+                                        # rationale in the .hpp, found via a false brake at 0.62m
+                                        # (reproduced twice) while still stationary at spawn
+    corridor_cloud_startup_grace_s: 3.0  # [s] ignore pointcloud right after activation — the
+                                          # false-positive distance itself varies (0.62m, 0.80m),
+                                          # so a distance cutoff alone isn't reliable; what's
+                                          # consistent is WHEN it happens (takeoff transition)
